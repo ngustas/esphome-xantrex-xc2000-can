@@ -1,0 +1,552 @@
+# ESPHome – Xantrex XC 2000 Pro CAN Bus Monitor
+# Decodes J1939-style CAN frames from the Xantrex XC 2000 Pro and
+# publishes DC/AC voltage, current, and power sensors to Home Assistant.
+#
+# Hardware tested: ESP32-S3-DevKitC-1 (has a built-in TWAI/CAN controller)
+#   TX → GPIO11, RX → GPIO12 (via a SN65HVD230 or equivalent CAN transceiver)
+#   CAN bus: 250 kbps, 29-bit extended IDs (J1939)
+#
+# NOTE: Classic ESP32 (WROOM-32) uses different safe GPIO pairs for TWAI,
+#       e.g. GPIO21/GPIO22. Adjust tx_pin/rx_pin accordingly.
+#
+# PGNs decoded:
+#   FEE8  – DC Inverter Input  (volts + amps)
+#   FFC7  – DC Charger Output  (charge amps, volts shared from FEE8)
+#   FFCA  – AC Input           (volts + amps + Hz)
+#   FFD7  – AC Output          (volts + amps + Hz)
+#   FFD5  – Unknown            (two raw single-byte fields, decode TBD — contributions welcome)
+
+esphome:
+  name: xantrex-xc2000
+  friendly_name: Xantrex XC2000
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf            # required for esp32_can / TWAI
+
+logger:
+  level: INFO
+  logs:
+    canbus: WARN             # suppress "received can message" spam
+    esp32_can: WARN
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  on_client_connected:
+    then:
+      - script.execute: publish_all_xantrex
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  ap:
+    ssid: "Xantrex Fallback Hotspot"
+    password: !secret ap_fallback_password
+
+captive_portal:
+
+substitutions:
+  # Averaging window for all sensor filters
+  AVG_WIN: "2s"
+
+# ---------------------------------------------------------------------------
+# CAN bus
+# ---------------------------------------------------------------------------
+canbus:
+  - platform: esp32_can
+    id: xantrex_can
+    tx_pin: GPIO11
+    rx_pin: GPIO12
+    can_id: 0x01             # source address this node uses on the J1939 bus
+    bit_rate: 250kbps
+    use_extended_id: true
+    # Optional: filter to known Xantrex PGNs to reduce interrupt load.
+    # Mask 0x1FFFFF00 matches any source address (low byte = SA, ignored).
+    # filters:
+    #   - id: 0x18FEE800     # FEE8 – DC Inverter Input
+    #     mask: 0x1FFFFF00
+    #     extended: true
+    #   - id: 0x18FFC700     # FFC7 – DC Charger Output
+    #     mask: 0x1FFFFF00
+    #     extended: true
+    #   - id: 0x18FFCA00     # FFCA – AC Input
+    #     mask: 0x1FFFFF00
+    #     extended: true
+    #   - id: 0x18FFD500     # FFD5 – unknown (do not rely on FFD7 formula)
+    #     mask: 0x1FFFFF00
+    #     extended: true
+    #   - id: 0x18FFD700     # FFD7 – AC Output
+    #     mask: 0x1FFFFF00
+    #     extended: true
+    on_frame:
+      - can_id: 0x00000000
+        can_id_mask: 0x00000000   # catch-all: receive every extended frame
+        use_extended_id: true
+        then:
+          - lambda: |-
+              // Extract PGN from 29-bit arbitration ID (J1939 style).
+              // For PDU2 (PF >= 0xF0) the PS byte is part of the PGN.
+              const uint32_t arb = can_id;
+              const uint8_t  pf  = (arb >> 16) & 0xFF;
+              const uint8_t  ps  = (arb >>  8) & 0xFF;
+              const uint32_t pgn = (pf < 0xF0)
+                                   ? ((uint32_t)pf << 8)
+                                   : (((uint32_t)pf << 8) | ps);
+
+              const auto &d = x;
+              if (d.size() < 8) return;
+
+              // Helpers
+              auto u16_le  = [](uint8_t b0, uint8_t b1) -> uint16_t { return (uint16_t)b1 << 8 | b0; };
+              auto is_na16 = [](uint16_t v){ return v == 0xFFFF; };
+              auto round1  = [](float v){ return roundf(v * 10.0f)  / 10.0f; };
+              auto round2  = [](float v){ return roundf(v * 100.0f) / 100.0f; };
+              auto near0   = [](float v){ return fabsf(v) < 0.5f; };
+
+              id(can_frame_count)++;
+              bool updated = false;
+
+              switch (pgn) {
+
+                // ----- FEE8: DC Inverter Input -----
+                // Byte 1-2: DC voltage  → raw / 20  [V]
+                // Byte 3-4: DC current  → (raw - 32000) / 20  [A], + = discharge
+                case 0xFEE8: {
+                  uint16_t vraw = u16_le(d[1], d[2]);
+                  uint16_t iraw = u16_le(d[3], d[4]);
+                  if (!is_na16(vraw)) {
+                    float v = vraw / 20.0f;
+                    if (v >= 9.0f && v <= 64.0f) {
+                      id(g_dc_in_volts)  = round2(v);
+                      id(g_dc_chg_volts) = id(g_dc_in_volts); // shared for charger-watts calc
+                      updated = true;
+                    }
+                  }
+                  if (!is_na16(iraw)) {
+                    float i = (iraw - 32000) / 20.0f;
+                    i = i * id(g_dc_current_gain) + id(g_dc_current_offset);
+                    if (id(g_invert_dc_current)) i = -i;  // flip for Victron-style sign convention
+                    if (near0(i)) i = 0.0f;
+                    if (i >= -800.0f && i <= 800.0f) {
+                      id(g_dc_in_amps) = round1(i);
+                      updated = true;
+                    }
+                  }
+                  id(g_dc_in_watts) = round1(id(g_dc_in_volts) * id(g_dc_in_amps));
+                  updated = true;
+                  break;
+                }
+
+                // ----- FFC7: DC Charger Output -----
+                // Byte 1-2: DC bus voltage (same as FEE8; redundant but present)
+                // Byte 3-4: charge current (same scaling as FEE8); published positive
+                // Byte 5:   charge current × 2 at 0.5 A resolution (redundant copy)
+                case 0xFFC7: {
+                  uint16_t iraw = u16_le(d[3], d[4]);
+                  if (!is_na16(iraw)) {
+                    float chg = fabsf((iraw - 32000) / 20.0f);
+                    if (chg < 1.0f) {
+                      id(g_dc_chg_amps)  = 0.0f;
+                      id(g_dc_chg_watts) = 0.0f;
+                    } else {
+                      id(g_dc_chg_amps)  = round1(chg);
+                      id(g_dc_chg_watts) = round1(id(g_dc_chg_volts) * id(g_dc_chg_amps));
+                    }
+                    updated = true;
+                  }
+                  break;
+                }
+
+                // ----- FFCA: AC Input -----
+                // Byte 1-2: AC voltage    → raw / 20         [V]
+                // Byte 3-4: AC current    → (raw - 32000)/20 [A]
+                // Byte 5-6: AC frequency  → raw / 128        [Hz]  reads 0 when no AC present
+                case 0xFFCA: {
+                  uint16_t vraw = u16_le(d[1], d[2]);
+                  uint16_t iraw = u16_le(d[3], d[4]);
+                  uint16_t fraw = u16_le(d[5], d[6]);
+                  if (!is_na16(vraw)) {
+                    float v = vraw / 20.0f;
+                    if (v >= 0.0f && v <= 300.0f) { id(g_ac_in_volts) = round1(v); updated = true; }
+                  }
+                  if (!is_na16(iraw)) {
+                    float i = (iraw - 32000) / 20.0f;
+                    if (i >= -200.0f && i <= 200.0f) { id(g_ac_in_amps) = round1(i); updated = true; }
+                  }
+                  id(g_ac_in_watts) = round1(id(g_ac_in_volts) * id(g_ac_in_amps));
+                  if (!is_na16(fraw)) {
+                    float hz = fraw / 128.0f;
+                    if (hz >= 45.0f && hz <= 70.0f) { id(g_ac_in_freq) = roundf(hz * 10.0f) / 10.0f; updated = true; }
+                  }
+                  updated = true;
+                  break;
+                }
+
+                // ----- FFD7: AC Output -----
+                // Same byte layout as FFCA; output frequency tracks input when AC is present
+                case 0xFFD7: {
+                  uint16_t vraw = u16_le(d[1], d[2]);
+                  uint16_t iraw = u16_le(d[3], d[4]);
+                  uint16_t fraw = u16_le(d[5], d[6]);
+                  if (!is_na16(vraw)) {
+                    float v = vraw / 20.0f;
+                    if (v >= 0.0f && v <= 300.0f) { id(g_ac_out_volts) = round1(v); updated = true; }
+                  }
+                  if (!is_na16(iraw)) {
+                    float i = (iraw - 32000) / 20.0f;
+                    if (i >= -200.0f && i <= 200.0f) { id(g_ac_out_amps) = round1(i); updated = true; }
+                  }
+                  id(g_ac_out_watts) = round1(id(g_ac_out_volts) * id(g_ac_out_amps));
+                  if (!is_na16(fraw)) {
+                    float hz = fraw / 128.0f;
+                    if (hz >= 45.0f && hz <= 70.0f) { id(g_ac_out_freq) = roundf(hz * 10.0f) / 10.0f; updated = true; }
+                  }
+                  updated = true;
+                  break;
+                }
+
+                // ----- FFD5: Unknown control/state fields -----
+                // d[1] = 0xC0 fixed — status/selector byte, not a measurement
+                // d[2] = field A  (single byte, range 88–99 in static captures)
+                // d[3] = 0x00 fixed — padding
+                // d[4] = field B  (single byte, range 70–99 in static captures)
+                // Live data shows d[4] oscillating in large square-wave patterns (~20–30s
+                // period) during pass-through mode — rules out temperature. Likely a
+                // charger duty-cycle, current setpoint, or internal state counter.
+                // d[2] is more stable but also not temperature-like.
+                // DECODE IS UNKNOWN — logged raw for observation.
+                case 0xFFD5: {
+                  uint8_t ta = d[2];
+                  uint8_t tb = d[4];
+                  if (ta > 0 && ta < 200) { id(g_ffd5_a) = (float)ta; updated = true; }
+                  if (tb > 0 && tb < 200) { id(g_ffd5_b) = (float)tb; updated = true; }
+                  break;
+                }
+
+                default:
+                  break;
+              }
+
+              if (updated) id(g_needs_publish) = true;
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+globals:
+  # DC current calibration – adjust gain if measured current is off by a fixed ratio,
+  # e.g. set gain: 1.33 if the unit reports 7 A but a clamp meter reads ~9.3 A.
+  - id: g_dc_current_gain
+    type: float
+    initial_value: '1.0'
+  - id: g_dc_current_offset
+    type: float
+    initial_value: '0.0'
+  # Set true to flip DC current polarity (+ = charging, Victron convention)
+  - id: g_invert_dc_current
+    type: bool
+    initial_value: 'false'
+  - id: g_needs_publish
+    type: bool
+    initial_value: 'false'
+  - id: can_frame_count
+    type: uint32_t
+    initial_value: '0'
+  # FEE8 – DC Inverter Input
+  - id: g_dc_in_volts
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_in_amps
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_in_watts
+    type: float
+    initial_value: '0.0'
+  # FFC7 – DC Charger Output (volts mirrored from FEE8)
+  - id: g_dc_chg_volts
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_chg_amps
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_chg_watts
+    type: float
+    initial_value: '0.0'
+  # FFCA – AC Input
+  - id: g_ac_in_volts
+    type: float
+    initial_value: '0.0'
+  - id: g_ac_in_amps
+    type: float
+    initial_value: '0.0'
+  - id: g_ac_in_watts
+    type: float
+    initial_value: '0.0'
+  - id: g_ac_in_freq
+    type: float
+    initial_value: '0.0'
+  # FFD7 – AC Output
+  - id: g_ac_out_volts
+    type: float
+    initial_value: '0.0'
+  - id: g_ac_out_amps
+    type: float
+    initial_value: '0.0'
+  - id: g_ac_out_watts
+    type: float
+    initial_value: '0.0'
+  - id: g_ac_out_freq
+    type: float
+    initial_value: '0.0'
+  # FFD5 – Unknown fields A and B (see CAN_DECODING.md)
+  - id: g_ffd5_a
+    type: float
+    initial_value: '0.0'
+  - id: g_ffd5_b
+    type: float
+    initial_value: '0.0'
+
+# ---------------------------------------------------------------------------
+# Script – push all cached values to HA at once
+# ---------------------------------------------------------------------------
+script:
+  - id: publish_all_xantrex
+    then:
+      - component.update: s_dc_in_volts
+      - component.update: s_dc_in_amps
+      - component.update: s_dc_in_watts
+      - component.update: s_dc_chg_volts
+      - component.update: s_dc_chg_amps
+      - component.update: s_dc_chg_watts
+      - component.update: s_ac_in_volts
+      - component.update: s_ac_in_amps
+      - component.update: s_ac_in_watts
+      - component.update: s_ac_in_freq
+      - component.update: s_ac_out_volts
+      - component.update: s_ac_out_amps
+      - component.update: s_ac_out_watts
+      - component.update: s_ac_out_freq
+      - component.update: s_ffd5_a
+      - component.update: s_ffd5_b
+
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: template
+    id: can_fps
+    name: "CAN Frames/s"
+    unit_of_measurement: "fps"
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: |-
+      static bool     inited = false;
+      static uint32_t last   = 0;
+      uint32_t now  = id(can_frame_count);
+      uint32_t diff = inited ? (now - last) : 0;
+      inited = true;
+      last   = now;
+      return (float) diff;
+
+  # --- FEE8: DC Inverter Input ---
+  - platform: template
+    id: s_dc_in_volts
+    name: "Xantrex DC In Volts"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_dc_in_volts);
+
+  - platform: template
+    id: s_dc_in_amps
+    name: "Xantrex DC In Amps"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_dc_in_amps);
+
+  - platform: template
+    id: s_dc_in_watts
+    name: "Xantrex DC In Watts"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_dc_in_watts);
+
+  # --- FFC7: DC Charger Output ---
+  - platform: template
+    id: s_dc_chg_volts
+    name: "Xantrex Charger Volts"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_dc_chg_volts);
+
+  - platform: template
+    id: s_dc_chg_amps
+    name: "Xantrex Charger Amps"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_dc_chg_amps);
+
+  - platform: template
+    id: s_dc_chg_watts
+    name: "Xantrex Charger Watts"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_dc_chg_watts);
+
+  # --- FFCA: AC Input ---
+  - platform: template
+    id: s_ac_in_volts
+    name: "Xantrex AC In Volts"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_in_volts);
+
+  - platform: template
+    id: s_ac_in_amps
+    name: "Xantrex AC In Amps"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_in_amps);
+
+  - platform: template
+    id: s_ac_in_watts
+    name: "Xantrex AC In Watts"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_in_watts);
+
+  - platform: template
+    id: s_ac_in_freq
+    name: "Xantrex AC In Frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_in_freq);
+
+  # --- FFD7: AC Output ---
+  - platform: template
+    id: s_ac_out_volts
+    name: "Xantrex AC Out Volts"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_out_volts);
+
+  - platform: template
+    id: s_ac_out_amps
+    name: "Xantrex AC Out Amps"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_out_amps);
+
+  - platform: template
+    id: s_ac_out_watts
+    name: "Xantrex AC Out Watts"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_out_watts);
+
+  - platform: template
+    id: s_ac_out_freq
+    name: "Xantrex AC Out Frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ac_out_freq);
+
+  # --- FFD5: Unknown fields A and B (logged raw, decode TBD) ---
+  # Live data shows FFD5-B oscillating in square waves during pass-through —
+  # rules out temperature. Likely charger duty-cycle, setpoint, or state counter.
+  - platform: template
+    id: s_ffd5_a
+    name: "Xantrex FFD5 Field A"
+    unit_of_measurement: "raw"
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ffd5_a);
+
+  - platform: template
+    id: s_ffd5_b
+    name: "Xantrex FFD5 Field B"
+    unit_of_measurement: "raw"
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_ffd5_b);
+
+# ---------------------------------------------------------------------------
+# Interval – publish on change, update CAN fps counter
+# ---------------------------------------------------------------------------
+interval:
+  - interval: 2s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(g_needs_publish);'
+          then:
+            - script.execute: publish_all_xantrex
+            - lambda: 'id(g_needs_publish) = false;'
+      - component.update: can_fps
