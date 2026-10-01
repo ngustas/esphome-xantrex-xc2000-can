@@ -123,12 +123,18 @@ silent after the update even though the inverter is fine. Auto-discovery in
 this config handles that automatically. See
 [CAN_DECODING.md](CAN_DECODING.md) for the full before/after table.
 
-### The card sleeps in standby
+### If RV-C traffic stops
 
-RV-C traffic **stops entirely** a few seconds after the inverter enters
-standby — the communication card uses ISO 11898-6 partial networking and powers
-down. It wakes on inverter activity. This looks like a dead integration but is
-normal behaviour; see CAN_DECODING.md before debugging a "dropout".
+Check wiring, connectors and termination first. During this project an
+apparent "the card went to sleep" dropout turned out to be a CAN connector
+knocked loose during unrelated work: traffic stopped at one instant and never
+resumed, with the inverter in pass-through at the time.
+
+The card does have ISO 11898-6 partial networking enabled and logs sleep
+commands when the inverter reaches standby, but over four days of continuous
+monitoring with the bus connected it never produced a gap of even 60 seconds.
+Treat sleep as unverified, not as the explanation for a dropout. See
+[CAN_DECODING.md](CAN_DECODING.md).
 
 ## Transmit controls
 
@@ -192,7 +198,7 @@ evidence for each is in [CAN_DECODING.md](CAN_DECODING.md).
 | Discharge current gain (1.30) | One calibration point at ~7.5 A; may not hold at heavier loads |
 | `0x1FFD3` pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
 | `0x1FFD3` inverter enable | Untested |
-| Partial-networking wake frame | Never observed waking a sleeping card |
+| Partial-networking sleep/wake | Enabled and logged, but never observed to interrupt the bus; wake frame untested |
 | `DC_SRC_STS4` | Byte layout not in any RV-C revision or library consulted; required for CC/CV |
 | `0x1FFC5` control-current offset | Bytes 3–4 inferred from `0x1FFC7`; neither confirmed nor disproven |
 | `0x1FFD5` reactive power | Raw; signedness and units unvalidated |

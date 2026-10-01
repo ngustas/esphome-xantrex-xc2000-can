@@ -371,12 +371,12 @@ pre-update history is lost.
 Practical consequence: an integration keyed to the old node address goes
 silent after a firmware update even though the inverter is working normally.
 
-### Partial networking (the card sleeps)
+### Partial networking (configured, but never observed to silence the bus)
 
 The card uses ISO 11898-6 selective wake-up via an Infineon TLE9255W
 transceiver — U3 2.08 added support for Infineon and NXP partial-networking
 parts, and 2.17 "corrected the setup of the TLE9255W ... for wakeup via CAN
-frame". Observed defaults after update:
+frame". Observed configuration after a 2.17 update:
 
 ```text
 Enable  true        Frame  extended
@@ -386,24 +386,38 @@ WakeId  0x00004200  WakeMask  0x0FFFFFF00
 
 Decoded as J1939 identifiers, both patterns carry PS = `0x42` — destination
 address 66, the *old* default node address, which did not follow `NodeAddr`
-to 143.
+to 143. U3 2.15 widened `WakeMask` from `0x0000ff00` "for compatibility with
+the XGW", which makes the wake pattern far more selective: only a frame
+matching `0x00004200` across the whole identifier qualifies, forcing priority
+to 0 and leaving just the source byte free.
 
-In the event log the card enters sleep about four seconds after the inverter
-reaches `Standby`, and woke from inverter activity rather than from the bus:
+The card's own event log records a `Sleep Command` about four seconds after
+the inverter reports `DEV_MODE: Standby`:
 
 ```text
 01:53:10  DEV_MODE: Standby
 01:53:14  Sleep Command
-01:53:32  DEV_MODE: Battery      (woke, no reboot)
+01:53:32  DEV_MODE: Battery
 ```
 
-So **RV-C traffic stops entirely while the inverter is in standby**, which
-looks like a dead integration rather than a sleeping node. U3 2.15 widened
-`WakeMask` from `0x0000ff00` to `0x0FFFFFF00` "for compatibility with the
-XGW", which means only a frame matching `0x00004200` across the whole
-identifier can wake it — priority is forced to 0 and only the source byte is
-free. Nothing on an ordinary RV-C bus sends that. Waking the card from the
-bus is therefore untested here, and local wake works regardless.
+**This was never observed to interrupt RV-C traffic.** Across four days of
+continuous monitoring with the bus connected — roughly 34,000 samples per day
+— there was not a single gap of 60 seconds or longer. Frame rate held at
+38–50 fps throughout, including while the inverter was idle.
+
+An earlier revision of this document claimed RV-C traffic "stops entirely in
+standby". That was wrong, and it is retracted. It was inferred from the log
+entries above combined with an observed dropout, and the dropout turned out
+to be a **physically disconnected CAN connector**: traffic stopped at one
+instant and never resumed, while the inverter was in `Pass-through` — a state
+the card does not sleep from.
+
+So partial networking is enabled and the firmware does issue sleep commands,
+but whether it ever takes the node off the bus in normal operation is
+**unverified**. If you see a sustained dropout, check wiring, connectors and
+termination before suspecting sleep. A genuine sleep would track the
+inverter into standby and recover when it wakes; a wiring fault stops
+abruptly and stays stopped.
 
 ## Commands: documented, not enabled
 
@@ -483,7 +497,9 @@ A responsible transmitter must be opt-in and should:
 - Confirm `0x1FFD3` pass-through enable (byte 1 bits 4–5) does anything. The
   Xantrex Freedom SW DGN guide marks that field unsupported while leaving
   inverter enable and load sense unmarked; untested on the XC Pro.
-- Establish whether a `0x00004200` wake frame actually wakes a sleeping card.
+- Establish whether partial networking ever actually takes the card off the
+  bus, and if so whether a `0x00004200` wake frame revives it. Four days of
+  continuous capture showed no sleep-related gap.
 - Confirm the reactive-power field's signedness and engineering units in `0x1FFD5`.
 - Capture `0x1FDAA` (`CHARGER_PROPERTIES`) from U3 2.15+ and map it against an authoritative RV-C definition.
 - Collect ISO Address Claim NAMEs from multiple XC Pro models before using manufacturer/function identity as a public auto-discovery rule.
