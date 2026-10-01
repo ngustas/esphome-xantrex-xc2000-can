@@ -8,7 +8,10 @@ The decoder supports older U3 1.x communication cards as well as U3 2.14+ cards 
 
 | Home Assistant value | RV-C DGN | Notes |
 |---|---:|---|
-| DC input volts, amps, watts | `0x1FEE8` | Inverter DC input |
+| **Net DC volts, amps, watts** | `0x1FFFD` | **Measured battery flow; + = charging.** The figure to trust |
+| DC source temperature | `0x1FFFC` | |
+| DC source SOC, time remaining | `0x1FFFC` | Diagnostic only — not populated by the observed unit, see below |
+| DC input volts, amps, watts | `0x1FEE8` | Inverter DC *input*; reads 0 while charging or in pass-through |
 | Charger target volts, amps, watts | `0x1FFC7` | Desired/control values on newer firmware |
 | Charge-current percent and charger state | `0x1FFC7` | Percent is `raw / 2` |
 | Measured charger volts, amps, watts, temperature | `0x1FEA3` | Added to the default transmit list in U3 2.14 |
@@ -66,7 +69,33 @@ U3 2.16 added a separately configurable DC instance for matching BMS `DC_SRC_STS
 
 ### DC current calibration
 
-Use `g_dc_current_gain` and `g_dc_current_offset` if a reference meter shows a repeatable error. `g_invert_dc_current` changes the sign convention; the default follows the Xantrex observation where positive inverter DC current means discharge.
+This unit measures **charge** current accurately and **discharge** current
+poorly. Against a SmartShunt and a Fluke clamp meter on the same conductor:
+
+| Direction | Unit reports | Reference | Ratio |
+|---|---|---|---|
+| Discharging (inverting) | 7.53 A | 9.77 A | 1.30 |
+| Discharging (inverting) | 7.04 A | 9.33 A | 1.33 |
+| Charging, 45–100 A | — | — | within 1% |
+
+`g_dc_current_gain` is therefore applied to the **discharge direction only**
+on `0x1FFFD`, and to `0x1FEE8` (which is only non-zero while inverting). It is
+deliberately *not* applied to `0x1FEA3` charger output. A blanket gain would
+corrupt the charge readings, which are already correct.
+
+The default 1.30 matches the observed unit at roughly 7.5 A of draw — a single
+calibration point. Check it against a reference meter at your own load before
+relying on it. `g_dc_current_offset` handles a fixed offset;
+`g_invert_dc_current` flips the `0x1FEE8` sign convention.
+
+### State of charge is not real
+
+The SOC field in `0x1FFFC` reads a constant **100%** on the observed unit. It
+has no battery capacity configured (`0x1FFC6` reports bank size as "not
+available", and `0x1FFFB` is not implemented at all), and it measures only its
+own current, so it cannot compute one. The value is a valid encoding rather
+than the "unavailable" code, so it cannot be filtered out — it is exposed as a
+diagnostic entity named *unverified*. Use a battery shunt or BMS instead.
 
 ## Firmware update warning
 
@@ -81,11 +110,44 @@ Never mix files between these packages. Follow the Xantrex work instructions for
 
 For Freedom XC Pro 2000 part `818-2010`, Xantrex lists U1 `>= 2.96` as the prerequisite for U3 2.17 charging-control behavior. A unit at U1 2.87 / U3 1.06 follows the U3 1.0x migration package, but the U1 prerequisite must be resolved before relying on charging control.
 
-Firmware updates can reset configuration and the CAN address. Recheck model, instances, battery type, charge-current limit, and the discovered source address afterward.
+The bootloader update reinitialises the card's flash file system and **resets
+the entire CAN configuration section to defaults while leaving the inverter
+and charger settings untouched**. Observed on a 1.06 → 2.17 update: node
+address 66 → 143, the partial-networking wake mask widened, the receive
+heartbeat changed from `IsoAddrClaim` to `DiagMsg1`, and `DCSrcSts1` /
+`ChgSts2` were added to the transmit list. Battery type, charge current and
+voltage setpoints all survived.
+
+The practical effect is that an integration keyed to the old node address goes
+silent after the update even though the inverter is fine. Auto-discovery in
+this config handles that automatically. See
+[CAN_DECODING.md](CAN_DECODING.md) for the full before/after table.
+
+### The card sleeps in standby
+
+RV-C traffic **stops entirely** a few seconds after the inverter enters
+standby — the communication card uses ISO 11898-6 partial networking and powers
+down. It wakes on inverter activity. This looks like a dead integration but is
+normal behaviour; see CAN_DECODING.md before debugging a "dropout".
 
 ## Transmit controls
 
-This repository intentionally remains monitor-only. Xantrex release notes confirm that U3 2.11 improved inverter/charger on/off command handling and U3 2.17 accepts a valid CC/CV Control Current through `CHARGER_COMMAND` (`0x1FFC5`) without overwriting non-volatile MAX_CHARGE_CURRENT setting #24. That does not make arbitrary transmit payloads safe.
+This repository intentionally remains monitor-only. Transmit was nonetheless
+exercised on hardware to establish what actually works, and the results are
+documented so that anyone adding a transmitter starts from evidence rather
+than from release-note prose:
+
+| DGN | Result on hardware |
+|---|---|
+| `0x1FFC4` max charge current | **Works.** Layout validated, non-destructive with correct no-change fill, applied in ~2 s |
+| `0x1FFC5` charger enable/disable | **Works.** State changes within ~2 s |
+| `0x1FFC5` CC/CV control current | **Inert** in 3-stage mode; two payload variants tried |
+| `0x1FFD3` inverter enable | Untested |
+| `0x1FFD3` pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
+
+`0x1FFC4` writes **non-volatile setting #24**, which survives a power cycle —
+setting a low charge limit and forgetting is a genuine hazard. None of this
+makes arbitrary transmit payloads safe.
 
 Documented command DGNs include:
 

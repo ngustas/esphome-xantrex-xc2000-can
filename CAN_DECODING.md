@@ -41,6 +41,39 @@ Earlier notes/tools called `0x1FEE8` simply `FEE8` because they discarded the da
 
 Therefore a filter must mask the low source byte, and application code should either discover the source from inverter-specific traffic or allow it to be configured. The supplied YAML defaults to auto-discovery, latches only on inverter-specific DGNs, and permits rediscovery after 30 seconds of silence. Pin a source address when multiple inverters share a bus.
 
+Confirmed on hardware: a unit updated from U3 1.06 to 2.17 moved from `0x42`
+to `0x8F` as part of the update, and auto-discovery followed it without
+intervention.
+
+#### Observed ISO Address Claim
+
+The card transmits `ADDRESS_CLAIM` (`0xEE00`) once per second, which is
+unusual — RV-C specifies "on request only" broadcast, and most nodes answer
+only when asked. One unit produced:
+
+```text
+src 0x8F (143)  NAME 803C81080EFE6696
+  manufacturer code 119      function 129 (inverter/charger)
+  function instance 1        identity 0x1E6696
+  arbitrary address capable  SET
+```
+
+The arbitrary-address-capable bit being set is the device stating outright
+that it does dynamic addressing, which is why no fixed address is safe.
+
+Identifying the unit by manufacturer + function is more robust than inferring
+it from DGN traffic, because the NAME is burned into the device and survives
+the configuration reset described below. **This is a single sample** — do not
+treat manufacturer 119 as a universal Xantrex constant until it is confirmed
+on other models and build dates. The supplied YAML therefore still
+discovers by DGN signature.
+
+#### Surveying a bus
+
+Listening passively for `ADDRESS_CLAIM` will miss most nodes, for the reason
+above. To enumerate a bus, log every distinct source address seen on any
+frame, or send a global DGN request for `0xEE00`.
+
 ### Instances
 
 **Observed:** inverter/DC status instance `1`; AC output instance `0x41` (AC line in the high nibble, instance in the low nibble).
@@ -70,7 +103,19 @@ Reserved/not-available values must not be scaled. The code rejects the reserved 
 | 3–4 | DC input current | `(raw - 32000) / 20 A` | Observed |
 | 5–7 | unavailable in captures | — | Observed |
 
-Positive current meant inverter discharge in the captures. During pass-through/charging, this inverter-input current may be near zero and is not a battery-shunt measurement.
+Positive current meant inverter discharge in the captures. During
+pass-through or charging this field reads **0.0 A**, because it is the
+inverter's DC input rather than a battery measurement. Confirmed on hardware:
+while the battery was being charged at 97 A, FEE8 still read `0.0`.
+
+Measured accuracy while inverting is poor. Against a SmartShunt and a Fluke
+clamp meter on the same conductor, the unit reported 7.53 A where both
+references read 9.77 A, and 7.04 A against 9.33 A — ratios of 1.30 and 1.33.
+Charge current from `0x1FFFD` / `0x1FEA3` on the same unit is accurate to
+within 1%, so this is specific to the inverting path and not a global scale
+error. A plausible cause is that inverter DC draw pulsates at twice line
+frequency and the unit's averaging under-reads it. Apply `g_dc_current_gain`
+to the discharge direction only.
 
 ### `0x1FFC7` – Charger Status 1
 
@@ -104,10 +149,126 @@ U3 2.15 explicitly separated desired charge current reported here from the user-
 | 0 low nibble | Instance | compare to configured inverter instance | RV-C-defined |
 | 0 high nibble | Charger type | enum not exposed yet | RV-C-defined |
 | 3–4 | Measured output voltage | `raw / 20 V` | RV-C-defined/observed |
-| 5–6 | Measured output current | `(raw - 32000) / 20 A` | RV-C-defined; sign needs broader validation |
+| 5–6 | Measured output current | `(raw - 32000) / 20 A` | RV-C-defined; observed |
 | 7 | Charger temperature | `raw - 40 °C` | RV-C-defined; Xantrex fix in 2.16 |
 
+Sign convention is **positive = charging**, confirmed against a shunt during a
+bulk charge: this field and `0x1FFFD` agreed to within 0.16 A across a
+45–100 A range, and the shunt tracked both to within ~1%. Note that this is
+the opposite polarity to `0x1FFFD`, which needs negating.
+
+It reads `0.00 A` whenever the charger is idle, including while the inverter
+is running — it reports charger output, not net battery current. Use
+`0x1FFFD` for battery flow.
+
 This is the preferred measured charger-output frame on U3 2.14+.
+
+### `0x1FFFD` – DC Source Status 1
+
+**Observed.** The only measured net DC current this unit publishes, and the
+figure to trust for battery flow. It is transmitted every 500 ms; U3 2.16/2.17
+added `DCSrcSts1` to the default transmit list.
+
+| Byte(s) | Field | Decode | Confidence |
+|---|---|---|---|
+| 0 | DC source instance | compare to configured DC instance | RV-C-defined |
+| 1 | Device priority | enum (100 = inverter/charger) | RV-C-defined |
+| 2–3 | DC voltage | `raw / 20 V` | RV-C-defined; observed |
+| 4–7 | DC current | `(raw - 0x77359400) * 0.001 A` | RV-C-defined; observed |
+
+The current field is **uint32 with 0.001 A resolution and 0 A at `0x77359400`**
+(RV-C Table 5.3) — a different width, scale and offset from the uint16
+`0.05 A` fields used elsewhere in this document. Reusing the uint16 helper here
+produces nonsense. The "not available" code is `0xFFFFFFFF`; an unpopulated
+field reads as roughly ±2,000,000 A rather than zero, which makes a decode
+error obvious.
+
+Two observed quirks:
+
+- **Sign is inverted** relative to a battery shunt. Measured against a
+  SmartShunt during a charge ramp, the shunt peaked at `+9.019 A` while this
+  field read `-8.960 A` — 0.7% apart on two independent instruments. Negate to
+  get the conventional "+ = charging".
+- **Effective resolution is 0.128 A**, not the 0.001 A the encoding allows. All
+  observed values are multiples of 128 counts; the low seven bits are always
+  zero.
+
+When the charger is idle and the unit is not inverting this field reads exactly
+`0.000 A` — a valid encoded zero, not an unpopulated field. Sampling it only in
+that state can easily create the false impression that it is hardcoded.
+
+### `0x1FFFC` – DC Source Status 2
+
+| Byte(s) | Field | Decode | Confidence |
+|---|---|---|---|
+| 0 | DC source instance | compare to configured DC instance | RV-C-defined |
+| 1 | Device priority | enum | RV-C-defined |
+| 2–3 | Source temperature | `raw / 32 - 273 °C` | RV-C-defined; observed |
+| 4 | State of charge | `raw / 2 %` | RV-C-defined; **placeholder on this unit** |
+| 5–6 | Time remaining | minutes | RV-C-defined; reported unavailable |
+
+**State of charge is not real on the observed unit.** It emits a constant
+`200` (= 100%) regardless of actual battery state. That is a *valid* encoding,
+not the `255` "data not available" code, so it cannot be filtered out — it
+reads as a confident, wrong 100%. Three independent findings explain why the
+unit cannot produce a real figure:
+
+1. No battery capacity is configured anywhere. The USB configuration file has
+   no capacity field, and `0x1FFC6` reports battery bank size as `0xFFFF`
+   ("data not available").
+2. `0x1FFFB` (DC Source Status 3), which carries state of health, capacity
+   remaining and relative capacity, is **not implemented** — four separate
+   requests drew no response at all.
+3. The unit measures only its own DC current. Coulomb counting a bank requires
+   seeing all current in and out.
+
+The likely intent is that a BMS on the RV-C bus supplies state of charge and
+the inverter republishes it. With no BMS present there is no source, and the
+unit emits a placeholder rather than marking the field unavailable.
+
+Time remaining is reported as `0xFFFF` (unavailable), which is at least honest.
+
+### `0x1FFC6` – Charger Configuration Status
+
+**Not broadcast.** This DGN only answers a DGN request (see below). U3 2.15
+reports the user-configured maximum charge current here, separate from the
+desired current in `0x1FFC7`.
+
+| Byte(s) | Field | Decode | Confidence |
+|---|---|---|---|
+| 0 | Instance | low nibble | Observed |
+| 1 | Charging algorithm | `2` = 3-stage | Observed |
+| 2 | Charger mode | `0` = stand-alone | Observed |
+| 3 high nibble | Battery type | `3` = LiFePO4 | Observed |
+| 4–5 | Battery bank size | Ah; reads `0xFFFF` on this unit | Observed |
+| 6–7 | Maximum charging current | `(raw - 32000) / 20 A` | Observed |
+
+An observed frame, cross-checked against the unit's own configuration:
+
+```text
+01 02 00 30 FF FF D0 84   -> 3-stage, LiFePO4, bank n/a, max 100.00 A
+01 02 00 30 FF FF E8 80   -> same, max  50.00 A
+01 02 00 30 FF FF 84 80   -> same, max  45.00 A
+```
+
+Note the asymmetry with the write side: maximum charging current is **uint16 at
+bytes 6–7** in this status message but **uint8 at byte 7** in
+`CHARGER_CONFIGURATION_COMMAND` (`0x1FFC4`), and battery type moves from byte 3
+to byte 6. The two layouts are not interchangeable.
+
+### Requesting a non-broadcast DGN
+
+`0x1FFC6` and other request-only DGNs are retrieved with a standard DGN request
+(`0xEA00`, RV-C 3.3.2a): three data bytes carrying the wanted DGN LSB-first,
+addressed to the target node.
+
+```text
+CAN ID  0x18EA<dest><src>      e.g. 0x18EA8FA0 = to 0x8F from 0xA0
+Data    C6 FF 01               request DGN 1FFC6
+Data    FB FF 01               request DGN 1FFFB  (no response from this unit)
+```
+
+Requests are read-only and change nothing on the unit.
 
 ### `0x1FFCA` – AC Input Status
 
@@ -188,16 +349,122 @@ For Freedom XC Pro 2000 part `818-2010`, the Xantrex compatibility table require
 
 Always identify the installed U3 version and board assembly, use the matching complete package, and follow the vendor work instructions. Never combine files from the two packages.
 
+### What the update resets
+
+The bootloader update reinitialises the communication card's flash file
+system. **The entire `CAN` section of the card's configuration returns to
+defaults while the `InvChg` settings survive untouched.** Observed across a
+1.06 → 2.17 update:
+
+| Setting | Before | After |
+|---|---|---|
+| `NodeAddr` | 66 | 143 |
+| `WakeMask` | `0x0000ff00` | `0x0FFFFFF00` |
+| `ReceiveTimers` | `IsoAddrClaim, 1500` | `DiagMsg1, 11000` |
+| `DCSrcInst` | absent | 1 |
+| `TransmitTimers` | 12 entries | 14 — adds `ChgSts2`, `DCSrcSts1` |
+
+Battery type, charge current, absorption/float voltages, LBCO thresholds and
+transfer mode all came through unchanged. The event log also restarts, so
+pre-update history is lost.
+
+Practical consequence: an integration keyed to the old node address goes
+silent after a firmware update even though the inverter is working normally.
+
+### Partial networking (the card sleeps)
+
+The card uses ISO 11898-6 selective wake-up via an Infineon TLE9255W
+transceiver — U3 2.08 added support for Infineon and NXP partial-networking
+parts, and 2.17 "corrected the setup of the TLE9255W ... for wakeup via CAN
+frame". Observed defaults after update:
+
+```text
+Enable  true        Frame  extended
+SleepId 0x01234200  SleepMask 0x01FFFF00
+WakeId  0x00004200  WakeMask  0x0FFFFFF00
+```
+
+Decoded as J1939 identifiers, both patterns carry PS = `0x42` — destination
+address 66, the *old* default node address, which did not follow `NodeAddr`
+to 143.
+
+In the event log the card enters sleep about four seconds after the inverter
+reaches `Standby`, and woke from inverter activity rather than from the bus:
+
+```text
+01:53:10  DEV_MODE: Standby
+01:53:14  Sleep Command
+01:53:32  DEV_MODE: Battery      (woke, no reboot)
+```
+
+So **RV-C traffic stops entirely while the inverter is in standby**, which
+looks like a dead integration rather than a sleeping node. U3 2.15 widened
+`WakeMask` from `0x0000ff00` to `0x0FFFFFF00` "for compatibility with the
+XGW", which means only a frame matching `0x00004200` across the whole
+identifier can wake it — priority is forced to 0 and only the source byte is
+free. Nothing on an ordinary RV-C bus sends that. Waking the card from the
+bus is therefore untested here, and local wake works regardless.
+
 ## Commands: documented, not enabled
 
 | DGN | Purpose | Status here |
 |---:|---|---|
 | `0x1FFD3` | Inverter enable, pass-through, load sense | Documented; no transmitter shipped |
 | `0x1FFC5` | Charger enable/disable/actions and CC/CV control current | Xantrex support confirmed; control-current layout/use still requires validation |
-| `0x1FFC4` | Charger configuration | Can alter persistent charge settings; no transmitter shipped |
+| `0x1FFC4` | Charger configuration | Layout validated on hardware (below); still no transmitter shipped |
 | `0x1FFD0` / `0x1FFCF` | Inverter configuration | Documented; no transmitter shipped |
 
-U3 2.17's volatile Control Current is specifically for CC/CV mode and does not modify setting #24. Tests in a three-stage charging configuration found candidate `0x1FFC5` control-current payloads inert, which is consistent with the command being mode-dependent; it is not proof of a general-purpose current limiter.
+### `0x1FFC4` write: validated layout
+
+A maximum-charge-current write was exercised on hardware and **confirmed**,
+with a full-byte `0x1FFC6` readback after every attempt. The layout differs
+from the status message:
+
+| Byte | Field | Encoding |
+|---|---|---|
+| 0 | Instance | uint8 |
+| 1 | Charging algorithm | uint8, `0xFF` = no change |
+| 2 | Charger mode | uint8, `0xFF` = no change |
+| 3 | Battery sensor / installation line | `0xFF` = no change |
+| 4–5 | Battery bank size | uint16, `0xFFFF` = no change |
+| 6 | Battery type | uint4, `0xFF` = no change |
+| 7 | Maximum charging current | **uint8, 1 A/bit** |
+
+Filling every unrelated field with the RV-C "data not available" value
+leaves them untouched. Verified across writes of 100, 50, 10, 30 and 45 A:
+only bytes 6–7 of the `0x1FFC6` readback ever changed, with charging
+algorithm (`02`, 3-stage) and battery type (`3`, LiFePO4) stable throughout.
+The unit applied each change within about two seconds, and `0x1FFC7`
+desired-current followed. Writes were accepted while actively charging,
+which is looser than U3 2.16's note about accepting changes only when the
+BMS is not controlling or the unit is not charging.
+
+This writes **non-volatile setting #24** and survives a power cycle. Setting
+it low and forgetting is a real hazard: 10 A into a 300 Ah bank is a very
+long charge.
+
+### `0x1FFC5` volatile control current: inert outside CC/CV
+
+U3 2.17's volatile Control Current is specifically for CC/CV mode and does
+not modify setting #24. Two candidate payloads were tested on a unit in
+**3-stage** mode, with the current as uint16 `0.05 A/bit` at bytes 3–4
+(mirroring `0x1FFC7`, where the status counterpart carries charge current):
+
+| Variant | Byte 1 (status) | Result |
+|---|---|---|
+| 1 | `0xFF` (no change) | no effect |
+| 2 | `0x01` (enable) | no effect |
+
+Both frames were accepted without complaint and nothing changed, while the
+same unit responded to `0x1FFC4` in about two seconds. The second variant
+rules out "the unit needs a valid status byte before parsing the rest".
+
+The remaining explanation is the release note's own scoping: the parameter
+applies to **CC/CV mode**, which is BMS-directed. A unit running its own
+3-stage algorithm has nothing for a control current to attach to. Reaching
+CC/CV requires `DC_SRC_STS4`, whose byte layout is not in any RV-C revision
+or library consulted here. **The byte 3–4 offset was never confirmed and is
+not the reason these tests failed** — do not treat it as disproven either.
 
 A responsible transmitter must be opt-in and should:
 
@@ -210,7 +477,13 @@ A responsible transmitter must be opt-in and should:
 
 ## Remaining validation work
 
-- Validate `0x1FEA3` current sign across charge/discharge transitions.
+- Re-measure the ~1.30 discharge current ratio at a heavier inverter load; it
+  rests on a single ~7.5 A point and may not be a constant if the cause is a
+  waveform-averaging effect.
+- Confirm `0x1FFD3` pass-through enable (byte 1 bits 4–5) does anything. The
+  Xantrex Freedom SW DGN guide marks that field unsupported while leaving
+  inverter enable and load sense unmarked; untested on the XC Pro.
+- Establish whether a `0x00004200` wake frame actually wakes a sleeping card.
 - Confirm the reactive-power field's signedness and engineering units in `0x1FFD5`.
 - Capture `0x1FDAA` (`CHARGER_PROPERTIES`) from U3 2.15+ and map it against an authoritative RV-C definition.
 - Collect ISO Address Claim NAMEs from multiple XC Pro models before using manufacturer/function identity as a public auto-discovery rule.

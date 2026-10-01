@@ -68,6 +68,11 @@ substitutions:
   inv_instance: "1"
   ac_instance: "0x41"
 
+  # DC source instance on DC_SOURCE_STATUS_1/2 (1FFFD/1FFFC). U3 2.16 made
+  # this configurable separately from inv_instance. A BMS also transmits
+  # these DGNs; the source-address filter is what keeps them apart here.
+  dcsrc_instance: "1"
+
 # ---------------------------------------------------------------------------
 # CAN bus
 # ---------------------------------------------------------------------------
@@ -303,6 +308,69 @@ canbus:
                 }
 
                 // ----- 1FFD4: Inverter Status -----
+                // ----- 1FFFD: DC Source Status 1 -----
+                // The only MEASURED net DC current this unit publishes.
+                // FEE8 is inverter *input* (~0 while charging or in
+                // pass-through) and FFC7 current is a setpoint, so neither
+                // tracks the battery. Byte 4-7 is uint32, 0.001 A/bit with
+                // 0 A at 0x77359400 (RV-C Table 5.3) -- a different width and
+                // offset from the uint16 0.05 A fields used elsewhere.
+                // Observed: sign is inverted relative to a battery shunt, so
+                // it is negated here to give + = charging. The unit also
+                // quantises to 0.128 A (low 7 bits always zero).
+                case 0x1FFFD: {
+                  if (d[0] != ${dcsrc_instance}) return;
+                  uint16_t vraw = u16_le(d[2], d[3]);
+                  if (valid16(vraw)) {
+                    float v = vraw / 20.0f;
+                    if (v >= 9.0f && v <= 64.0f) {
+                      id(g_dc_src_volts) = round2(v);
+                      updated = true;
+                    }
+                  }
+                  uint32_t iraw = (uint32_t) d[4] | ((uint32_t) d[5] << 8) |
+                                  ((uint32_t) d[6] << 16) | ((uint32_t) d[7] << 24);
+                  if (iraw <= 0xFFFFFFFCu) {
+                    double i = -(((double) iraw - 2000000000.0) * 0.001);
+                    // Discharge-only correction. Observed on a 300 Ah bank:
+                    // while inverting this field read ~30% low against a shunt
+                    // and a clamp meter, but while charging it agreed within
+                    // 1% over 45-100 A. Applying a gain in both directions
+                    // would corrupt the charge readings.
+                    if (i < 0) i *= id(g_dc_current_gain);
+                    if (near0((float) i)) i = 0.0;
+                    if (i >= -800.0 && i <= 800.0) {
+                      id(g_dc_src_amps) = round2((float) i);
+                      updated = true;
+                    }
+                  }
+                  id(g_dc_src_watts) = round1(id(g_dc_src_volts) * id(g_dc_src_amps));
+                  break;
+                }
+
+                // ----- 1FFFC: DC Source Status 2 -----
+                // Temperature is real. State of charge and time remaining are
+                // NOT populated by this unit -- see CAN_DECODING.md. SoC is
+                // emitted as a constant 100% placeholder (byte 4 = 200), which
+                // is a valid encoding rather than the "unavailable" code, so it
+                // cannot be filtered out. Exposed as diagnostic only.
+                case 0x1FFFC: {
+                  if (d[0] != ${dcsrc_instance}) return;
+                  uint16_t traw = u16_le(d[2], d[3]);
+                  if (valid16(traw)) {
+                    float t = traw / 32.0f - 273.0f;
+                    if (t >= -50.0f && t <= 200.0f) {
+                      id(g_dc_src_temp) = round1(t);
+                      updated = true;
+                    }
+                  }
+                  id(g_dc_src_soc) = d[4] <= 250 ? d[4] * 0.5f : NAN;
+                  uint16_t tr = u16_le(d[5], d[6]);
+                  id(g_dc_src_time_left) = tr <= 65532 ? (float) tr : NAN;
+                  updated = true;
+                  break;
+                }
+
                 case 0x1FFD4: {
                   if (d[0] != ${inv_instance}) return;
                   id(g_inverter_state) = d[1] & 0x0F;
@@ -320,8 +388,13 @@ canbus:
 # Globals
 # ---------------------------------------------------------------------------
 globals:
-  # DC current calibration – adjust gain if measured current is off by a fixed ratio,
-  # e.g. set gain: 1.33 if the unit reports 7 A but a clamp meter reads ~9.3 A.
+  # DC current calibration. Applies to FEE8 (inverter DC input, only non-zero
+  # while inverting) and to the DISCHARGE half of 1FFFD only -- this unit
+  # under-reports inverter draw by roughly 30% against a shunt and a clamp
+  # meter (7.53 A vs 9.77 A; 7.04 A vs 9.33 A) while its charge current is
+  # accurate to within 1% over 45-100 A. 1.30 matches the observed unit;
+  # verify against a reference meter before trusting it, and note the
+  # calibration rests on a single load point.
   - id: g_dc_current_gain
     type: float
     initial_value: '1.0'
@@ -344,6 +417,25 @@ globals:
   - id: g_xantrex_src_ms
     type: uint32_t
     initial_value: '0'
+  # 1FFFD / 1FFFC – DC Source Status (measured net DC, temperature)
+  - id: g_dc_src_volts
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_src_amps
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_src_watts
+    type: float
+    initial_value: '0.0'
+  - id: g_dc_src_temp
+    type: float
+    initial_value: 'NAN'
+  - id: g_dc_src_soc
+    type: float
+    initial_value: 'NAN'
+  - id: g_dc_src_time_left
+    type: float
+    initial_value: 'NAN'
   # FEE8 – DC Inverter Input
   - id: g_dc_in_volts
     type: float
@@ -456,6 +548,12 @@ script:
       - component.update: s_ac_out_reactive_raw
       - component.update: s_fet_temp
       - component.update: s_transformer_temp
+      - component.update: s_dc_src_volts
+      - component.update: s_dc_src_amps
+      - component.update: s_dc_src_watts
+      - component.update: s_dc_src_temp
+      - component.update: s_dc_src_soc
+      - component.update: s_dc_src_time_left
       - component.update: s_xantrex_src
 
 # ---------------------------------------------------------------------------
@@ -479,6 +577,75 @@ sensor:
       last   = now;
       return (float) diff;
 
+  # --- 1FFFD / 1FFFC: DC Source Status ---------------------------------
+  # s_dc_src_amps is the measured net DC current and is the figure to trust
+  # for battery flow; + = charging after the sign correction.
+  - platform: template
+    id: s_dc_src_volts
+    name: "DC Source Volts"
+    device_class: voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: never
+    lambda: |-
+      return id(g_dc_src_volts);
+
+  - platform: template
+    id: s_dc_src_amps
+    name: "DC Source Amps"
+    device_class: current
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    update_interval: never
+    lambda: |-
+      return id(g_dc_src_amps);
+
+  - platform: template
+    id: s_dc_src_watts
+    name: "DC Source Watts"
+    device_class: power
+    unit_of_measurement: "W"
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      return id(g_dc_src_watts);
+
+  - platform: template
+    id: s_dc_src_temp
+    name: "DC Source Temperature"
+    device_class: temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      return id(g_dc_src_temp);
+
+  # DIAGNOSTIC ONLY. The observed unit has no battery capacity configured
+  # (1FFC6 bank size reads "not available" and 1FFFB is not implemented), so
+  # it cannot compute a real state of charge and emits a constant 100%.
+  # Kept because another unit or firmware may populate it; do not build
+  # automations on it without checking it actually moves.
+  - platform: template
+    id: s_dc_src_soc
+    name: "DC Source SOC (unverified)"
+    entity_category: diagnostic
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      return id(g_dc_src_soc);
+
+  - platform: template
+    id: s_dc_src_time_left
+    name: "DC Source Time Remaining"
+    entity_category: diagnostic
+    device_class: duration
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      return id(g_dc_src_time_left);
   - platform: template
     id: s_xantrex_src
     name: "Xantrex CAN Source Address"
