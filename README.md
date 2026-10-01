@@ -125,16 +125,17 @@ this config handles that automatically. See
 
 ### If RV-C traffic stops
 
-Check wiring, connectors and termination first. During this project an
-apparent "the card went to sleep" dropout turned out to be a CAN connector
-knocked loose during unrelated work: traffic stopped at one instant and never
-resumed, with the inverter in pass-through at the time.
+Check wiring, connectors and termination first.
 
-The card does have ISO 11898-6 partial networking enabled and logs sleep
-commands when the inverter reaches standby, but over four days of continuous
-monitoring with the bus connected it never produced a gap of even 60 seconds.
-Treat sleep as unverified, not as the explanation for a dropout. See
-[CAN_DECODING.md](CAN_DECODING.md).
+The card has ISO 11898-6 partial networking enabled and logs a sleep command
+when the inverter reaches standby, which makes "it went to sleep" a tempting
+explanation for a dropout. It is not a verified one: over four days of
+continuous monitoring with the bus connected, the frame rate never dropped
+for even 60 seconds.
+
+The two causes look different. A genuine sleep would follow the inverter into
+standby and recover when it wakes. A wiring fault stops abruptly, at one
+instant, and stays stopped regardless of what the inverter is doing.
 
 ## Transmit controls
 

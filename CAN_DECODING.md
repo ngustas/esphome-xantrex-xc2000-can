@@ -371,7 +371,7 @@ pre-update history is lost.
 Practical consequence: an integration keyed to the old node address goes
 silent after a firmware update even though the inverter is working normally.
 
-### Partial networking (configured, but never observed to silence the bus)
+### Partial networking
 
 The card uses ISO 11898-6 selective wake-up via an Infineon TLE9255W
 transceiver — U3 2.08 added support for Infineon and NXP partial-networking
@@ -387,37 +387,18 @@ WakeId  0x00004200  WakeMask  0x0FFFFFF00
 Decoded as J1939 identifiers, both patterns carry PS = `0x42` — destination
 address 66, the *old* default node address, which did not follow `NodeAddr`
 to 143. U3 2.15 widened `WakeMask` from `0x0000ff00` "for compatibility with
-the XGW", which makes the wake pattern far more selective: only a frame
-matching `0x00004200` across the whole identifier qualifies, forcing priority
-to 0 and leaving just the source byte free.
+the XGW", making the wake pattern far more selective: only a frame matching
+`0x00004200` across the whole identifier qualifies, which forces priority to
+0 and leaves just the source byte free.
 
-The card's own event log records a `Sleep Command` about four seconds after
-the inverter reports `DEV_MODE: Standby`:
+The card's event log records a `Sleep Command` roughly four seconds after the
+inverter reports `DEV_MODE: Standby`.
 
-```text
-01:53:10  DEV_MODE: Standby
-01:53:14  Sleep Command
-01:53:32  DEV_MODE: Battery
-```
-
-**This was never observed to interrupt RV-C traffic.** Across four days of
-continuous monitoring with the bus connected — roughly 34,000 samples per day
-— there was not a single gap of 60 seconds or longer. Frame rate held at
-38–50 fps throughout, including while the inverter was idle.
-
-An earlier revision of this document claimed RV-C traffic "stops entirely in
-standby". That was wrong, and it is retracted. It was inferred from the log
-entries above combined with an observed dropout, and the dropout turned out
-to be a **physically disconnected CAN connector**: traffic stopped at one
-instant and never resumed, while the inverter was in `Pass-through` — a state
-the card does not sleep from.
-
-So partial networking is enabled and the firmware does issue sleep commands,
-but whether it ever takes the node off the bus in normal operation is
-**unverified**. If you see a sustained dropout, check wiring, connectors and
-termination before suspecting sleep. A genuine sleep would track the
-inverter into standby and recover when it wakes; a wiring fault stops
-abruptly and stays stopped.
+**Whether this ever takes the node off the bus is unverified.** Four days of
+continuous capture with the bus connected — about 34,000 samples per day —
+showed no gap of 60 seconds or longer, with frame rate steady at 38–50 fps
+including while the inverter was idle. Do not assume a dropout is the card
+sleeping; see the troubleshooting note in the README.
 
 ## Commands: documented, not enabled
 
