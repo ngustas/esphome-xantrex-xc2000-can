@@ -144,24 +144,24 @@ exercised on hardware to establish what actually works, and the results are
 documented so that anyone adding a transmitter starts from evidence rather
 than from release-note prose:
 
-| DGN | Result on hardware |
-|---|---|
-| `0x1FFC4` max charge current | **Works.** Layout validated, non-destructive with correct no-change fill, applied in ~2 s |
-| `0x1FFC5` charger enable/disable | **Works.** State changes within ~2 s |
-| `0x1FFC5` CC/CV control current | **Inert** in 3-stage mode; two payload variants tried |
-| `0x1FFD3` inverter enable | Untested |
-| `0x1FFD3` pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
+| DGN | Purpose | Result on hardware |
+|---|---|---|
+| `0x1FFC4` | Charger configuration (max charge current) | **Works.** Layout validated across five values; `0xFF` no-change fill proven non-destructive by full-byte readback; applied in ~2 s. Writes non-volatile setting #24 |
+| `0x1FFC5` | Charger enable / disable | **Works.** State changes within ~2 s, confirmed by charger state and by AC and DC current |
+| `0x1FFC5` | CC/CV control current | **Inert** in 3-stage mode; two payload variants tried (status `0xFF` and `0x01`) |
+| `0xEE00` | ISO address claim | **Works.** Address claimed and held; the node also answers `0xEA00` requests for its own claim |
+| `0xEA00` | DGN request | **Works.** `0x1FFC6` answers on request; `0x1FFFB` never responds |
+| `0x1FFD3` | Inverter enable | Untested |
+| `0x1FFD3` | Pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
+| `0x00004200` | Partial-networking wake frame | Untested |
+| `0x1FFD0` / `0x1FFCF` | Inverter configuration | Not attempted |
 
 `0x1FFC4` writes **non-volatile setting #24**, which survives a power cycle —
 setting a low charge limit and forgetting is a genuine hazard. None of this
 makes arbitrary transmit payloads safe.
 
-Documented command DGNs include:
-
-- `0x1FFD3` – inverter enable, pass-through, and load-sense command
-- `0x1FFC5` – charger enable/disable/actions and CC/CV control current
-- `0x1FFC4` – charger configuration
-- `0x1FFD0` / `0x1FFCF` – inverter configuration
+Byte layouts and the reasoning behind each result are in
+[CAN_DECODING.md](CAN_DECODING.md).
 
 Any future transmit implementation should be opt-in, claim a non-conflicting source address, validate target source and instance, rate-limit writes, use reserved/not-available encodings correctly, and require status/readback confirmation. Do not treat untested control fields as proven safe.
 

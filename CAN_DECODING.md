@@ -402,12 +402,17 @@ sleeping; see the troubleshooting note in the README.
 
 ## Commands: documented, not enabled
 
-| DGN | Purpose | Status here |
-|---:|---|---|
-| `0x1FFD3` | Inverter enable, pass-through, load sense | Documented; no transmitter shipped |
-| `0x1FFC5` | Charger enable/disable/actions and CC/CV control current | Xantrex support confirmed; control-current layout/use still requires validation |
-| `0x1FFC4` | Charger configuration | Layout validated on hardware (below); still no transmitter shipped |
-| `0x1FFD0` / `0x1FFCF` | Inverter configuration | Documented; no transmitter shipped |
+| DGN | Purpose | Result on hardware |
+|---|---|---|
+| `0x1FFC4` | Charger configuration (max charge current) | **Works.** Layout validated across five values; `0xFF` no-change fill proven non-destructive by full-byte readback; applied in ~2 s. Writes non-volatile setting #24 |
+| `0x1FFC5` | Charger enable / disable | **Works.** State changes within ~2 s, confirmed by charger state and by AC and DC current |
+| `0x1FFC5` | CC/CV control current | **Inert** in 3-stage mode; two payload variants tried (status `0xFF` and `0x01`) |
+| `0xEE00` | ISO address claim | **Works.** Address claimed and held; the node also answers `0xEA00` requests for its own claim |
+| `0xEA00` | DGN request | **Works.** `0x1FFC6` answers on request; `0x1FFFB` never responds |
+| `0x1FFD3` | Inverter enable | Untested |
+| `0x1FFD3` | Pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
+| `0x00004200` | Partial-networking wake frame | Untested |
+| `0x1FFD0` / `0x1FFCF` | Inverter configuration | Not attempted |
 
 ### `0x1FFC4` write: validated layout
 

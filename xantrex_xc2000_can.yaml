@@ -18,6 +18,17 @@
 #   1FFD5 – AC Output Power         (real power + provisional reactive raw)
 #   1FEBD – Inverter Temperature   (FET + transformer)
 #   1FFD4 – Inverter Status        (operating state)
+#   1FFFD – DC Source Status 1      (MEASURED net DC volts/amps)
+#   1FFFC – DC Source Status 2      (source temperature; SOC is a placeholder)
+#
+# RECEIVE-ONLY BY DESIGN. This config never transmits: no address is claimed
+# and no command frames are sent. Transmit was exercised separately on
+# hardware to find out what the unit actually accepts -- 1FFC4 max charge
+# current and 1FFC5 charger enable/disable both work; the 1FFC5 CC/CV control
+# current is inert outside CC/CV mode; 1FFD3 inverter enable and pass-through
+# are untested. Results, byte layouts and the safety argument are in
+# CAN_DECODING.md. Do not bolt a transmitter on without reading it: 1FFC4
+# writes non-volatile charger configuration.
 
 esphome:
   name: xantrex-xc2000
