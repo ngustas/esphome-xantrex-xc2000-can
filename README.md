@@ -165,6 +165,42 @@ Any future transmit implementation should be opt-in, claim a non-conflicting sou
 - **Observed:** bus captures from a Freedom XC Pro 2000.
 - **Provisional:** plausible interpretations that still need controlled validation.
 
+## Known gaps and open decisions
+
+Everything below is deliberately unresolved rather than overlooked. Detail and
+evidence for each is in [CAN_DECODING.md](CAN_DECODING.md).
+
+### Decisions a maintainer should revisit
+
+- **Should the SOC entity exist at all?** `DC Source SOC (unverified)` is a
+  constant 100% placeholder on the one unit tested, and it is a valid encoding
+  rather than the "unavailable" code, so it cannot be filtered out. It is kept
+  as a diagnostic because a different unit — or one with a BMS on the bus —
+  may populate it honestly. If that never materialises, delete it: a sensor
+  that reads a confident wrong value is worse than no sensor.
+- **Should manufacturer code 119 drive discovery?** Identifying the inverter
+  from its Address Claim NAME (manufacturer 119, function 129) would be more
+  robust than the current DGN-signature inference, because the NAME survives
+  the configuration reset a firmware update performs. It rests on **one**
+  sample, so the code still discovers by DGN signature. Confirm 119 on another
+  model or build date before changing that.
+
+### Untested or single-sample
+
+| Item | Status |
+|---|---|
+| Discharge current gain (1.30) | One calibration point at ~7.5 A; may not hold at heavier loads |
+| `0x1FFD3` pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
+| `0x1FFD3` inverter enable | Untested |
+| Partial-networking wake frame | Never observed waking a sleeping card |
+| `DC_SRC_STS4` | Byte layout not in any RV-C revision or library consulted; required for CC/CV |
+| `0x1FFC5` control-current offset | Bytes 3–4 inferred from `0x1FFC7`; neither confirmed nor disproven |
+| `0x1FFD5` reactive power | Raw; signedness and units unvalidated |
+| `0x1FDAA` CHARGER_PROPERTIES | Supported from U3 2.15 but never captured |
+
+Captures from a second unit are the single most useful contribution — see the
+capture-setup notes at the end of CAN_DECODING.md.
+
 ## License
 
 MIT — use freely, no warranty. Not affiliated with or endorsed by Xantrex.
