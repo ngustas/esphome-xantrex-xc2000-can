@@ -1,2 +1,4 @@
+private/
 .esphome/
 secrets.yaml
+.claude/
