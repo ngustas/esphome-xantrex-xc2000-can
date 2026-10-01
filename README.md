@@ -151,10 +151,18 @@ than from release-note prose:
 | `0x1FFC5` | CC/CV control current | **Inert** in 3-stage mode; two payload variants tried (status `0xFF` and `0x01`) |
 | `0xEE00` | ISO address claim | **Works.** Address claimed and held; the node also answers `0xEA00` requests for its own claim |
 | `0xEA00` | DGN request | **Works.** `0x1FFC6` answers on request; `0x1FFFB` never responds |
-| `0x1FFD3` | Inverter enable | Untested |
-| `0x1FFD3` | Pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
-| `0x00004200` | Partial-networking wake frame | Untested |
-| `0x1FFD0` / `0x1FFCF` | Inverter configuration | Not attempted |
+| `0x1FFD3` | Inverter enable | **Untested here.** RV-C 6.20.9 defines byte 1 bits 0–1 (`00` off, `01` on); Xantrex marks the field supported and U3 2.11 reduced its reaction time, so it is expected to work |
+| `0x1FFD3` | Pass-through enable | **Untested here, and expected NOT to work.** RV-C defines byte 1 bits 4–5, but Xantrex marks this field unsupported on the Freedom SW. Taking the documentation at face value, the unit should accept the frame and ignore the bit |
+| `0x00004200` | Partial-networking wake frame | **Untested.** Matches the configured `WakeId`/`WakeMask`, and U3 2.17 fixed TLE9255W frame wake-up, so it should wake a sleeping card — but whether the card ever sleeps is itself unverified |
+| `0x1FFD0` / `0x1FFCF` | Inverter configuration | **Not attempted.** RV-C-defined; same no-change fill discipline as `0x1FFC4` would apply |
+
+The untested rows are untested because exercising them means taking a
+production inverter out of service — switching the inverter off, or moving
+the AC load onto the battery — rather than because they are expected to
+fail. Where the RV-C standard and the Xantrex documentation agree on a
+field's behaviour, this table reports that expectation and labels it
+untested. Expectations are not results: treat them as a starting point for
+your own validation, not as proven behaviour.
 
 `0x1FFC4` writes **non-volatile setting #24**, which survives a power cycle —
 setting a low charge limit and forgetting is a genuine hazard. None of this
@@ -197,7 +205,7 @@ evidence for each is in [CAN_DECODING.md](CAN_DECODING.md).
 | Item | Status |
 |---|---|
 | Discharge current gain (1.30) | One calibration point at ~7.5 A; may not hold at heavier loads |
-| `0x1FFD3` pass-through enable | Untested; Xantrex marks the equivalent field unsupported on the Freedom SW |
+| `0x1FFD3` pass-through / inverter enable | Untested — requires taking the inverter out of service; documented expectations are in the transmit table |
 | `0x1FFD3` inverter enable | Untested |
 | Partial-networking sleep/wake | Enabled and logged, but never observed to interrupt the bus; wake frame untested |
 | `DC_SRC_STS4` | Byte layout not in any RV-C revision or library consulted; required for CC/CV |
