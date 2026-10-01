@@ -9,12 +9,15 @@
 # NOTE: Classic ESP32 (WROOM-32) uses different safe GPIO pairs for TWAI,
 #       e.g. GPIO21/GPIO22. Adjust tx_pin/rx_pin accordingly.
 #
-# PGNs decoded:
-#   FEE8  – DC Inverter Input  (volts + amps)
-#   FFC7  – DC Charger Output  (charge amps, volts shared from FEE8)
-#   FFCA  – AC Input           (volts + amps + Hz)
-#   FFD7  – AC Output          (volts + amps + Hz)
-#   FFD5  – Unknown            (two raw single-byte fields, decode TBD — contributions welcome)
+# RV-C DGNs decoded (the leading 1 is the J1939 data-page bit):
+#   1FEE8 – Inverter DC Status      (volts + amps)
+#   1FFC7 – Charger Status          (targets, percent, state)
+#   1FEA3 – Charger Status 2        (measured volts/amps/temp; U3 >= 2.14)
+#   1FFCA – AC Input Status         (volts + amps + Hz)
+#   1FFD7 – AC Output Status        (volts + amps + Hz)
+#   1FFD5 – AC Output Power         (real power + provisional reactive raw)
+#   1FEBD – Inverter Temperature   (FET + transformer)
+#   1FFD4 – Inverter Status        (operating state)
 
 esphome:
   name: xantrex-xc2000
@@ -56,6 +59,15 @@ substitutions:
   # Averaging window for all sensor filters
   AVG_WIN: "2s"
 
+  # 0xFF auto-discovers the Xantrex from inverter-specific status DGNs.
+  # U3 <= 2.13 commonly used 0x42; U3 >= 2.14 defaults to 0x8F and supports
+  # dynamic addressing. Pin an address only when multiple inverters share a bus.
+  xantrex_source_address: "0xFF"
+
+  # Observed/default instances. Change these to match the unit configuration.
+  inv_instance: "1"
+  ac_instance: "0x41"
+
 # ---------------------------------------------------------------------------
 # CAN bus
 # ---------------------------------------------------------------------------
@@ -67,22 +79,22 @@ canbus:
     can_id: 0x01             # source address this node uses on the J1939 bus
     bit_rate: 250kbps
     use_extended_id: true
-    # Optional: filter to known Xantrex PGNs to reduce interrupt load.
+    # Optional: filter to known Xantrex DGNs to reduce interrupt load.
     # Mask 0x1FFFFF00 matches any source address (low byte = SA, ignored).
     # filters:
-    #   - id: 0x18FEE800     # FEE8 – DC Inverter Input
+    #   - id: 0x19FEE800     # 1FEE8 – Inverter DC Status
     #     mask: 0x1FFFFF00
     #     extended: true
-    #   - id: 0x18FFC700     # FFC7 – DC Charger Output
+    #   - id: 0x19FFC700     # 1FFC7 – Charger Status
     #     mask: 0x1FFFFF00
     #     extended: true
-    #   - id: 0x18FFCA00     # FFCA – AC Input
+    #   - id: 0x19FFCA00     # 1FFCA – AC Input Status
     #     mask: 0x1FFFFF00
     #     extended: true
-    #   - id: 0x18FFD500     # FFD5 – unknown (do not rely on FFD7 formula)
+    #   - id: 0x19FFD500     # 1FFD5 – AC Output Power
     #     mask: 0x1FFFFF00
     #     extended: true
-    #   - id: 0x18FFD700     # FFD7 – AC Output
+    #   - id: 0x19FFD700     # 1FFD7 – AC Output Status
     #     mask: 0x1FFFFF00
     #     extended: true
     on_frame:
@@ -91,21 +103,53 @@ canbus:
         use_extended_id: true
         then:
           - lambda: |-
-              // Extract PGN from 29-bit arbitration ID (J1939 style).
-              // For PDU2 (PF >= 0xF0) the PS byte is part of the PGN.
+              // Extract the full 18-bit J1939/RV-C DGN, including data page.
               const uint32_t arb = can_id;
               const uint8_t  pf  = (arb >> 16) & 0xFF;
-              const uint8_t  ps  = (arb >>  8) & 0xFF;
-              const uint32_t pgn = (pf < 0xF0)
-                                   ? ((uint32_t)pf << 8)
-                                   : (((uint32_t)pf << 8) | ps);
+              const uint8_t  src = arb & 0xFF;
+              uint32_t dgn = (arb >> 8) & 0x3FFFF;
+              if (pf < 0xF0) dgn &= 0x3FF00; // PDU1: PS is destination
 
               const auto &d = x;
               if (d.size() < 8) return;
 
+              // Early captures/tools omitted the data-page bit and called these
+              // FEE8/FFC7/etc. Accept that representation too, but use the full
+              // RV-C DGN everywhere else in this file.
+              switch (dgn) {
+                case 0xFEE8: case 0xFFC7: case 0xFEA3: case 0xFFCA:
+                case 0xFFD7: case 0xFFD5: case 0xFEBD: case 0xFFD4:
+                  dgn |= 0x10000;
+                  break;
+                default: break;
+              }
+
+              // The communication card is arbitrary-address-capable. In auto
+              // mode, latch only from inverter-specific DGNs (not generic BMS
+              // traffic), and allow rediscovery after 30 s of silence.
+              constexpr uint8_t configured_src = ${xantrex_source_address};
+              const bool inverter_signature =
+                  ((dgn == 0x1FEE8 || dgn == 0x1FFCA ||
+                    dgn == 0x1FEBD || dgn == 0x1FFD4) &&
+                   d[0] == ${inv_instance}) ||
+                  ((dgn == 0x1FFD7 || dgn == 0x1FFD5) &&
+                   d[0] == ${ac_instance});
+              const uint32_t now_ms = millis();
+              if (configured_src == 0xFF && inverter_signature &&
+                  (id(g_xantrex_src) == 0xFF ||
+                   now_ms - id(g_xantrex_src_ms) > 30000)) {
+                if (id(g_xantrex_src) != src)
+                  ESP_LOGI("xantrex", "discovered source address 0x%02X", src);
+                id(g_xantrex_src) = src;
+              }
+              if (src != id(g_xantrex_src)) return;
+              if (inverter_signature) id(g_xantrex_src_ms) = now_ms;
+
               // Helpers
               auto u16_le  = [](uint8_t b0, uint8_t b1) -> uint16_t { return (uint16_t)b1 << 8 | b0; };
-              auto is_na16 = [](uint16_t v){ return v == 0xFFFF; };
+              // RV-C reserves the upper end of most uint16 parameter ranges.
+              auto valid16 = [](uint16_t v){ return v <= 64255; };
+              auto valid_hz = [](uint16_t v){ return v <= 64000; };
               auto round1  = [](float v){ return roundf(v * 10.0f)  / 10.0f; };
               auto round2  = [](float v){ return roundf(v * 100.0f) / 100.0f; };
               auto near0   = [](float v){ return fabsf(v) < 0.5f; };
@@ -113,15 +157,16 @@ canbus:
               id(can_frame_count)++;
               bool updated = false;
 
-              switch (pgn) {
+              switch (dgn) {
 
                 // ----- FEE8: DC Inverter Input -----
                 // Byte 1-2: DC voltage  → raw / 20  [V]
                 // Byte 3-4: DC current  → (raw - 32000) / 20  [A], + = discharge
-                case 0xFEE8: {
+                case 0x1FEE8: {
+                  if (d[0] != ${inv_instance}) return;
                   uint16_t vraw = u16_le(d[1], d[2]);
                   uint16_t iraw = u16_le(d[3], d[4]);
-                  if (!is_na16(vraw)) {
+                  if (valid16(vraw)) {
                     float v = vraw / 20.0f;
                     if (v >= 9.0f && v <= 64.0f) {
                       id(g_dc_in_volts)  = round2(v);
@@ -129,7 +174,7 @@ canbus:
                       updated = true;
                     }
                   }
-                  if (!is_na16(iraw)) {
+                  if (valid16(iraw)) {
                     float i = (iraw - 32000) / 20.0f;
                     i = i * id(g_dc_current_gain) + id(g_dc_current_offset);
                     if (id(g_invert_dc_current)) i = -i;  // flip for Victron-style sign convention
@@ -145,22 +190,40 @@ canbus:
                 }
 
                 // ----- FFC7: DC Charger Output -----
-                // Byte 1-2: DC bus voltage (same as FEE8; redundant but present)
-                // Byte 3-4: charge current (same scaling as FEE8); published positive
-                // Byte 5:   charge current × 2 at 0.5 A resolution (redundant copy)
-                case 0xFFC7: {
+                // Byte 1-2: desired/control voltage
+                // Byte 3-4: desired/control current
+                // Byte 5: charge current percent of maximum, raw / 2 [%]
+                case 0x1FFC7: {
+                  if (d[0] != ${inv_instance}) return;
+                  uint16_t vraw = u16_le(d[1], d[2]);
                   uint16_t iraw = u16_le(d[3], d[4]);
-                  if (!is_na16(iraw)) {
-                    float chg = fabsf((iraw - 32000) / 20.0f);
-                    if (chg < 1.0f) {
-                      id(g_dc_chg_amps)  = 0.0f;
-                      id(g_dc_chg_watts) = 0.0f;
-                    } else {
-                      id(g_dc_chg_amps)  = round1(chg);
-                      id(g_dc_chg_watts) = round1(id(g_dc_chg_volts) * id(g_dc_chg_amps));
-                    }
+                  if (valid16(vraw)) {
+                    float v = vraw / 20.0f;
+                    if (v >= 9.0f && v <= 64.0f) id(g_dc_chg_volts) = round2(v);
+                  }
+                  if (valid16(iraw)) {
+                    // This is the desired/control current on newer firmware,
+                    // not necessarily an independent measured battery current.
+                    id(g_dc_chg_amps) = round1((iraw - 32000) / 20.0f);
+                    id(g_dc_chg_watts) = round1(id(g_dc_chg_volts) * id(g_dc_chg_amps));
                     updated = true;
                   }
+                  id(g_charge_percent) = d[5] <= 250 ? d[5] / 2.0f : NAN;
+                  id(g_charger_state) = d[6];
+                  break;
+                }
+
+                // ----- 1FEA3: Charger Status 2 (U3 >= 2.14) -----
+                // Measured output voltage/current. Byte 7 is degC with -40 offset.
+                case 0x1FEA3: {
+                  if ((d[0] & 0x0F) != ${inv_instance}) return;
+                  uint16_t vraw = u16_le(d[3], d[4]);
+                  uint16_t iraw = u16_le(d[5], d[6]);
+                  if (valid16(vraw)) id(g_chg2_volts) = round2(vraw / 20.0f);
+                  if (valid16(iraw)) id(g_chg2_amps) = round1((iraw - 32000) / 20.0f);
+                  id(g_chg2_watts) = round1(id(g_chg2_volts) * id(g_chg2_amps));
+                  id(g_chg2_temp) = d[7] <= 250 ? (float)d[7] - 40.0f : NAN;
+                  updated = true;
                   break;
                 }
 
@@ -168,20 +231,21 @@ canbus:
                 // Byte 1-2: AC voltage    → raw / 20         [V]
                 // Byte 3-4: AC current    → (raw - 32000)/20 [A]
                 // Byte 5-6: AC frequency  → raw / 128        [Hz]  reads 0 when no AC present
-                case 0xFFCA: {
+                case 0x1FFCA: {
+                  if (d[0] != ${inv_instance}) return;
                   uint16_t vraw = u16_le(d[1], d[2]);
                   uint16_t iraw = u16_le(d[3], d[4]);
                   uint16_t fraw = u16_le(d[5], d[6]);
-                  if (!is_na16(vraw)) {
+                  if (valid16(vraw)) {
                     float v = vraw / 20.0f;
                     if (v >= 0.0f && v <= 300.0f) { id(g_ac_in_volts) = round1(v); updated = true; }
                   }
-                  if (!is_na16(iraw)) {
+                  if (valid16(iraw)) {
                     float i = (iraw - 32000) / 20.0f;
                     if (i >= -200.0f && i <= 200.0f) { id(g_ac_in_amps) = round1(i); updated = true; }
                   }
                   id(g_ac_in_watts) = round1(id(g_ac_in_volts) * id(g_ac_in_amps));
-                  if (!is_na16(fraw)) {
+                  if (valid_hz(fraw)) {
                     float hz = fraw / 128.0f;
                     if (hz >= 45.0f && hz <= 70.0f) { id(g_ac_in_freq) = roundf(hz * 10.0f) / 10.0f; updated = true; }
                   }
@@ -191,20 +255,21 @@ canbus:
 
                 // ----- FFD7: AC Output -----
                 // Same byte layout as FFCA; output frequency tracks input when AC is present
-                case 0xFFD7: {
+                case 0x1FFD7: {
+                  if (d[0] != ${ac_instance}) return;
                   uint16_t vraw = u16_le(d[1], d[2]);
                   uint16_t iraw = u16_le(d[3], d[4]);
                   uint16_t fraw = u16_le(d[5], d[6]);
-                  if (!is_na16(vraw)) {
+                  if (valid16(vraw)) {
                     float v = vraw / 20.0f;
                     if (v >= 0.0f && v <= 300.0f) { id(g_ac_out_volts) = round1(v); updated = true; }
                   }
-                  if (!is_na16(iraw)) {
+                  if (valid16(iraw)) {
                     float i = (iraw - 32000) / 20.0f;
                     if (i >= -200.0f && i <= 200.0f) { id(g_ac_out_amps) = round1(i); updated = true; }
                   }
                   id(g_ac_out_watts) = round1(id(g_ac_out_volts) * id(g_ac_out_amps));
-                  if (!is_na16(fraw)) {
+                  if (valid_hz(fraw)) {
                     float hz = fraw / 128.0f;
                     if (hz >= 45.0f && hz <= 70.0f) { id(g_ac_out_freq) = roundf(hz * 10.0f) / 10.0f; updated = true; }
                   }
@@ -212,21 +277,36 @@ canbus:
                   break;
                 }
 
-                // ----- FFD5: Unknown control/state fields -----
-                // d[1] = 0xC0 fixed — status/selector byte, not a measurement
-                // d[2] = field A  (single byte, range 88–99 in static captures)
-                // d[3] = 0x00 fixed — padding
-                // d[4] = field B  (single byte, range 70–99 in static captures)
-                // Live data shows d[4] oscillating in large square-wave patterns (~20–30s
-                // period) during pass-through mode — rules out temperature. Likely a
-                // charger duty-cycle, current setpoint, or internal state counter.
-                // d[2] is more stable but also not temperature-like.
-                // DECODE IS UNKNOWN — logged raw for observation.
-                case 0xFFD5: {
-                  uint8_t ta = d[2];
-                  uint8_t tb = d[4];
-                  if (ta > 0 && ta < 200) { id(g_ffd5_a) = (float)ta; updated = true; }
-                  if (tb > 0 && tb < 200) { id(g_ffd5_b) = (float)tb; updated = true; }
+                // ----- 1FFD5: AC Output Power -----
+                // The earlier single-byte interpretation was wrong: bytes 2-3
+                // and 4-5 are little-endian fields. Real power is consistent
+                // with captures; reactive power signedness/scaling is provisional.
+                case 0x1FFD5: {
+                  if (d[0] != ${ac_instance}) return;
+                  uint16_t real = u16_le(d[2], d[3]);
+                  uint16_t reactive = u16_le(d[4], d[5]);
+                  if (real <= 65530) { id(g_ac_out_real_watts) = (float)real; updated = true; }
+                  if (reactive <= 65530) { id(g_ac_out_reactive_raw) = (float)reactive; updated = true; }
+                  break;
+                }
+
+                // ----- 1FEBD: Inverter Temperature Status -----
+                // uint16 fields: raw / 32 - 273 C. U3 2.14 fixed FET1 reporting.
+                case 0x1FEBD: {
+                  if (d[0] != ${inv_instance}) return;
+                  uint16_t fet = u16_le(d[1], d[2]);
+                  uint16_t transformer = u16_le(d[3], d[4]);
+                  if (valid16(fet)) id(g_fet_temp) = round1(fet / 32.0f - 273.0f);
+                  if (valid16(transformer)) id(g_transformer_temp) = round1(transformer / 32.0f - 273.0f);
+                  updated = true;
+                  break;
+                }
+
+                // ----- 1FFD4: Inverter Status -----
+                case 0x1FFD4: {
+                  if (d[0] != ${inv_instance}) return;
+                  id(g_inverter_state) = d[1] & 0x0F;
+                  updated = true;
                   break;
                 }
 
@@ -258,6 +338,12 @@ globals:
   - id: can_frame_count
     type: uint32_t
     initial_value: '0'
+  - id: g_xantrex_src
+    type: uint8_t
+    initial_value: '${xantrex_source_address}'
+  - id: g_xantrex_src_ms
+    type: uint32_t
+    initial_value: '0'
   # FEE8 – DC Inverter Input
   - id: g_dc_in_volts
     type: float
@@ -276,6 +362,25 @@ globals:
     type: float
     initial_value: '0.0'
   - id: g_dc_chg_watts
+    type: float
+    initial_value: '0.0'
+  - id: g_charge_percent
+    type: float
+    initial_value: '0.0'
+  - id: g_charger_state
+    type: uint8_t
+    initial_value: '255'
+  # 1FEA3 – measured Charger Status 2 values (U3 >= 2.14)
+  - id: g_chg2_volts
+    type: float
+    initial_value: '0.0'
+  - id: g_chg2_amps
+    type: float
+    initial_value: '0.0'
+  - id: g_chg2_watts
+    type: float
+    initial_value: '0.0'
+  - id: g_chg2_temp
     type: float
     initial_value: '0.0'
   # FFCA – AC Input
@@ -304,13 +409,23 @@ globals:
   - id: g_ac_out_freq
     type: float
     initial_value: '0.0'
-  # FFD5 – Unknown fields A and B (see CAN_DECODING.md)
-  - id: g_ffd5_a
+  # 1FFD5 – AC output power
+  - id: g_ac_out_real_watts
     type: float
     initial_value: '0.0'
-  - id: g_ffd5_b
+  - id: g_ac_out_reactive_raw
     type: float
     initial_value: '0.0'
+  # 1FEBD / 1FFD4
+  - id: g_fet_temp
+    type: float
+    initial_value: '0.0'
+  - id: g_transformer_temp
+    type: float
+    initial_value: '0.0'
+  - id: g_inverter_state
+    type: uint8_t
+    initial_value: '255'
 
 # ---------------------------------------------------------------------------
 # Script – push all cached values to HA at once
@@ -324,6 +439,11 @@ script:
       - component.update: s_dc_chg_volts
       - component.update: s_dc_chg_amps
       - component.update: s_dc_chg_watts
+      - component.update: s_charge_percent
+      - component.update: s_chg2_volts
+      - component.update: s_chg2_amps
+      - component.update: s_chg2_watts
+      - component.update: s_chg2_temp
       - component.update: s_ac_in_volts
       - component.update: s_ac_in_amps
       - component.update: s_ac_in_watts
@@ -332,8 +452,11 @@ script:
       - component.update: s_ac_out_amps
       - component.update: s_ac_out_watts
       - component.update: s_ac_out_freq
-      - component.update: s_ffd5_a
-      - component.update: s_ffd5_b
+      - component.update: s_ac_out_real_watts
+      - component.update: s_ac_out_reactive_raw
+      - component.update: s_fet_temp
+      - component.update: s_transformer_temp
+      - component.update: s_xantrex_src
 
 # ---------------------------------------------------------------------------
 # Sensors
@@ -341,7 +464,7 @@ script:
 sensor:
   - platform: template
     id: can_fps
-    name: "CAN Frames/s"
+    name: "CAN Frames per Second"
     unit_of_measurement: "fps"
     accuracy_decimals: 0
     update_interval: never
@@ -355,6 +478,16 @@ sensor:
       inited = true;
       last   = now;
       return (float) diff;
+
+  - platform: template
+    id: s_xantrex_src
+    name: "Xantrex CAN Source Address"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      if (id(g_xantrex_src) == 0xFF) return NAN;
+      return (float) id(g_xantrex_src);
 
   # --- FEE8: DC Inverter Input ---
   - platform: template
@@ -423,6 +556,62 @@ sensor:
     filters:
       - throttle_average: ${AVG_WIN}
     lambda: return id(g_dc_chg_watts);
+
+  - platform: template
+    id: s_charge_percent
+    name: "Xantrex Charge Current Percent of Max"
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_charge_percent);
+
+  # --- 1FEA3: Charger Status 2 (measured output; U3 >= 2.14) ---
+  - platform: template
+    id: s_chg2_volts
+    name: "Xantrex Charger Measured Volts"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_chg2_volts);
+
+  - platform: template
+    id: s_chg2_amps
+    name: "Xantrex Charger Measured Amps"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_chg2_amps);
+
+  - platform: template
+    id: s_chg2_watts
+    name: "Xantrex Charger Measured Watts"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_chg2_watts);
+
+  - platform: template
+    id: s_chg2_temp
+    name: "Xantrex Charger Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_chg2_temp);
 
   # --- FFCA: AC Input ---
   - platform: template
@@ -514,28 +703,89 @@ sensor:
       - throttle_average: ${AVG_WIN}
     lambda: return id(g_ac_out_freq);
 
-  # --- FFD5: Unknown fields A and B (logged raw, decode TBD) ---
-  # Live data shows FFD5-B oscillating in square waves during pass-through —
-  # rules out temperature. Likely charger duty-cycle, setpoint, or state counter.
+  # --- 1FFD5: AC Output Power ---
   - platform: template
-    id: s_ffd5_a
-    name: "Xantrex FFD5 Field A"
-    unit_of_measurement: "raw"
+    id: s_ac_out_real_watts
+    name: "Xantrex AC Out Real Power"
+    unit_of_measurement: "W"
+    device_class: power
     accuracy_decimals: 0
     update_interval: never
     filters:
       - throttle_average: ${AVG_WIN}
-    lambda: return id(g_ffd5_a);
+    lambda: return id(g_ac_out_real_watts);
 
   - platform: template
-    id: s_ffd5_b
-    name: "Xantrex FFD5 Field B"
+    id: s_ac_out_reactive_raw
+    name: "Xantrex AC Out Reactive Power (Provisional)"
     unit_of_measurement: "raw"
     accuracy_decimals: 0
     update_interval: never
     filters:
       - throttle_average: ${AVG_WIN}
-    lambda: return id(g_ffd5_b);
+    lambda: return id(g_ac_out_reactive_raw);
+
+  # --- 1FEBD: Inverter Temperature Status ---
+  - platform: template
+    id: s_fet_temp
+    name: "Xantrex FET Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_fet_temp);
+
+  - platform: template
+    id: s_transformer_temp
+    name: "Xantrex Transformer Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: ${AVG_WIN}
+    lambda: return id(g_transformer_temp);
+
+text_sensor:
+  - platform: template
+    id: s_inverter_state
+    name: "Xantrex Inverter State"
+    update_interval: 2s
+    lambda: |-
+      switch (id(g_inverter_state)) {
+        case 0: return {"Off"};
+        case 1: return {"Inverting"};
+        case 2: return {"Pass-through"};
+        case 3: return {"APS only"};
+        case 4: return {"Load sense"};
+        case 5: return {"Waiting to invert"};
+        case 6: return {"Short circuit"};
+        case 7: return {"Overtemperature"};
+        case 8: return {"Undervoltage"};
+        case 9: return {"Overvoltage"};
+        case 10: return {"Internal fault"};
+        case 11: return {"Communication lost"};
+        default: return {"Unknown"};
+      }
+
+  - platform: template
+    id: s_charger_state
+    name: "Xantrex Charger State"
+    update_interval: 2s
+    lambda: |-
+      switch (id(g_charger_state)) {
+        case 0: return {"Undefined"};
+        case 1: return {"Do not charge"};
+        case 2: return {"Bulk"};
+        case 3: return {"Absorption"};
+        case 4: return {"Overcharge"};
+        case 5: return {"Equalize"};
+        case 6: return {"Float"};
+        case 7: return {"Constant voltage/current"};
+        default: return {"Unknown"};
+      }
 
 # ---------------------------------------------------------------------------
 # Interval – publish on change, update CAN fps counter

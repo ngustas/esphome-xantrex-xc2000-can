@@ -1,163 +1,108 @@
-# ESPHome – Xantrex XC 2000 Pro CAN Bus Monitor
+# ESPHome – Xantrex Freedom XC Pro 2000 RV-C monitor
 
-Monitor your Xantrex XC 2000 Pro inverter/charger from Home Assistant using an ESP32 and a cheap CAN transceiver. All values are decoded directly from the unit's J1939 CAN bus — no serial adapter, no Modbus, no proprietary gateway required.
+Monitor a Xantrex Freedom XC Pro 2000 inverter/charger from Home Assistant with an ESP32 and CAN transceiver. The configuration is receive-only: it decodes RV-C/J1939 status traffic but does not transmit commands or change inverter settings.
 
-**Sensors published to Home Assistant:**
+The decoder supports older U3 1.x communication cards as well as U3 2.14+ cards whose CAN source address may differ. It auto-discovers the inverter from inverter-specific DGNs instead of assuming the address is always `0x42`.
 
-| Sensor | Source PGN | Unit |
-|---|---|---|
-| DC In Volts | FEE8 | V |
-| DC In Amps | FEE8 | A |
-| DC In Watts | FEE8 | W |
-| Charger Volts | FFC7 | V |
-| Charger Amps | FFC7 | A |
-| Charger Watts | FFC7 | W |
-| AC In Volts | FFCA | V |
-| AC In Amps | FFCA | A |
-| AC In Watts | FFCA | W |
-| AC In Frequency | FFCA | Hz |
-| AC Out Volts | FFD7 | V |
-| AC Out Amps | FFD7 | A |
-| AC Out Watts | FFD7 | W |
-| AC Out Frequency | FFD7 | Hz |
-| FFD5 Field A | FFD5 | raw |
-| FFD5 Field B | FFD5 | raw |
-| CAN Frames/s | — | fps |
+## Sensors
 
-> **FFD5 — decode unknown:** FFD5 carries two single-byte fields (d[2] and d[4]). The FFD7 voltage/current formula does not apply (produces 1212 V / −1595 A). A temperature hypothesis was proposed based on static captures (values 70–99) but ruled out by live data: Field B oscillates in large square-wave transitions every ~20–30 seconds during pass-through mode, which is inconsistent with any thermal sensor. Current best guess is charger duty-cycle or internal state signalling. Both fields are logged as raw integers. See [CAN_DECODING.md](CAN_DECODING.md) for full analysis.
+| Home Assistant value | RV-C DGN | Notes |
+|---|---:|---|
+| DC input volts, amps, watts | `0x1FEE8` | Inverter DC input |
+| Charger target volts, amps, watts | `0x1FFC7` | Desired/control values on newer firmware |
+| Charge-current percent and charger state | `0x1FFC7` | Percent is `raw / 2` |
+| Measured charger volts, amps, watts, temperature | `0x1FEA3` | Added to the default transmit list in U3 2.14 |
+| AC input volts, amps, VA, frequency | `0x1FFCA` | Watts label is retained for compatibility; mathematically V×A is apparent power |
+| AC output volts, amps, VA, frequency | `0x1FFD7` | Observed AC instance `0x41` |
+| AC output real power | `0x1FFD5` | Corrected from the original single-byte hypothesis |
+| AC output reactive field | `0x1FFD5` | Raw/provisional pending signedness and scale validation |
+| FET and transformer temperatures | `0x1FEBD` | `raw / 32 - 273 °C`; FET1 reporting fixed in U3 2.14 |
+| Inverter and charger states | `0x1FFD4`, `0x1FFC7` | RV-C enum labels, including CC/CV state 7 |
+| Xantrex source address and bus frame rate | — | Diagnostics |
 
----
+See [CAN_DECODING.md](CAN_DECODING.md) for byte layouts, evidence levels, firmware behavior, and command safety notes.
 
 ## Hardware
 
-### ESP32 board
+Any ESP32/ESP32-S3 with a TWAI controller works. The example targets a LilyGo T-Display S3 / ESP32-S3-DevKitC-1 and an SN65HVD230 3.3 V CAN transceiver.
 
-Any ESP32 or ESP32-S3 with a built-in TWAI (CAN) controller works. Tested on a **LilyGo T-Display S3** (ESP32-S3-DevKitC-1 compatible).
-
-> **Classic ESP32 (WROOM-32) users:** GPIOs 11 and 12 are tied to the SPI flash on that module. Use a different pair — GPIO21/GPIO22 or GPIO16/GPIO17 are common safe choices. Update `tx_pin` and `rx_pin` in the YAML accordingly.
-
-### CAN transceiver
-
-The ESP32 TWAI peripheral is a controller only — it needs a physical-layer transceiver to drive the bus. A **SN65HVD230** (3.3 V) module is the most common choice and costs a few dollars.
-
-```
+```text
 ESP32-S3        SN65HVD230       Xantrex CAN port
-─────────       ──────────       ────────────────
-GPIO11  ──────► TX               
-GPIO12  ◄─────  RX               
-3.3 V   ──────  VCC              
-GND     ──────  GND              
-                CANH  ◄────────► CANH
-                CANL  ◄────────► CANL
+GPIO11  ------> TX
+GPIO12  <------ RX
+3.3 V   ------  VCC
+GND     ------  GND
+                CANH  <-------> CANH (DB9 pin 7)
+                CANL  <-------> CANL (DB9 pin 2)
+                GND   <-------> GND  (DB9 pin 3 or 6)
 ```
 
-The Xantrex XC 2000 Pro has a standard 9-pin DB9 CAN port (CANopen/J1939 pinout):
-- Pin 2 → CANL  
-- Pin 7 → CANH  
-- Pin 3 / Pin 6 → GND  
-
-> Add a 120 Ω termination resistor across CANH/CANL if the ESP32 node is at either end of the bus. Many SN65HVD230 breakout boards have a solder-jumper for this.
-
----
+The bus uses 250 kbit/s and 29-bit extended IDs. Add 120 ohm termination only when this node is physically at a bus end. Classic ESP32/WROOM-32 boards must not use GPIO11/12; GPIO21/22 or GPIO16/17 are common alternatives.
 
 ## Setup
 
-### 1. Copy the YAML
+1. Copy `xantrex_xc2000_can.yaml` into the ESPHome configuration directory.
+2. Add `api_encryption_key`, `ota_password`, `ap_fallback_password`, `wifi_ssid`, and `wifi_password` to `secrets.yaml`.
+3. Adjust `tx_pin` and `rx_pin` for the board.
+4. Flash with `esphome run xantrex_xc2000_can.yaml` or the ESPHome Dashboard.
+5. Add the discovered ESPHome device to Home Assistant.
 
-Copy `xantrex_xc2000_can.yaml` into your ESPHome config directory (the folder where your other `.yaml` devices live).
+Generate an API key with `esphome generate-api-key`.
 
-### 2. Add secrets
+### Address and instance configuration
 
-Add the following entries to your `secrets.yaml`:
-
-```yaml
-api_encryption_key: "generate with: esphome generate-api-key"
-ota_password: "your-ota-password"
-ap_fallback_password: "your-fallback-ap-password"
-wifi_ssid: "your-wifi-ssid"
-wifi_password: "your-wifi-password"
-```
-
-Generate a fresh API encryption key with:
-```bash
-esphome generate-api-key
-```
-
-### 3. Adjust pins (if needed)
-
-If you are not using an ESP32-S3 or your board uses different CAN pins, update these two lines:
-
-```yaml
-canbus:
-  - platform: esp32_can
-    tx_pin: GPIO11    # ← change to your TX pin
-    rx_pin: GPIO12    # ← change to your RX pin
-```
-
-### 4. Flash
-
-```bash
-esphome run xantrex_xc2000_can.yaml
-```
-
-Or use the ESPHome Dashboard — add the file and click **Install**.
-
-### 5. Add to Home Assistant
-
-Once the device is online, Home Assistant will discover it automatically via the ESPHome integration. Accept the prompt and enter the API key you set in `secrets.yaml`.
-
----
-
-## Configuration options
-
-### DC current calibration
-
-If the reported DC current is consistently off by a fixed ratio, adjust the gain global. For example, if the unit reports 7 A but a clamp meter reads 9.3 A:
-
-```yaml
-globals:
-  - id: g_dc_current_gain
-    initial_value: '1.33'    # 9.3 / 7 ≈ 1.33
-```
-
-A fixed offset (in amps) can also be dialled in with `g_dc_current_offset`.
-
-### DC current sign convention
-
-By default, positive current means the battery is discharging (Xantrex convention). Set `g_invert_dc_current` to `true` if you want positive to mean charging (Victron convention):
-
-```yaml
-globals:
-  - id: g_invert_dc_current
-    initial_value: 'true'
-```
-
-### Averaging window
-
-All sensors use a `throttle_average` filter. The default window is 2 seconds. Change the substitution to suit your dashboard refresh rate:
+The recommended defaults are:
 
 ```yaml
 substitutions:
-  AVG_WIN: "5s"    # slower, smoother
+  xantrex_source_address: "0xFF"  # auto-discover
+  inv_instance: "1"              # observed inverter/DC instance
+  ac_instance: "0x41"            # observed AC output instance
 ```
 
----
+U3 2.14 changed the communication card's default CAN node address to decimal 143 (`0x8F`) and supports dynamic addressing. Older captures used decimal 66 (`0x42`). Auto-discovery is therefore safer than a fixed filter. If two compatible inverters share one bus, set `xantrex_source_address` explicitly after checking the diagnostic sensor/log.
 
-## CAN bus wiring tips
+U3 2.16 added a separately configurable DC instance for matching BMS `DC_SRC_STS` traffic. This monitor does not transmit BMS messages, but integrations that do must match the configured DC instance.
 
-- Keep CAN wiring twisted-pair and away from AC lines.
-- The Xantrex runs at **250 kbps** — do not change `bit_rate`.
-- If you see `esp32_can: E` errors in the log, check termination, wire length, and that CANH/CANL are not swapped.
-- The `CAN Frames/s` sensor is useful for confirming the bus is active. A healthy idle typically shows 10–30 fps.
+### DC current calibration
 
----
+Use `g_dc_current_gain` and `g_dc_current_offset` if a reference meter shows a repeatable error. `g_invert_dc_current` changes the sign convention; the default follows the Xantrex observation where positive inverter DC current means discharge.
 
-## Technical reference
+## Firmware update warning
 
-See [CAN_DECODING.md](CAN_DECODING.md) for the full byte-level breakdown of each PGN, scaling formulas, and notes from the original CAN sniffing session.
+The two current U3 2.17 packages reach the same application (`U3 2.17`) and segmented bootloader (`3.00`) through different, non-interchangeable migration paths:
 
----
+| Starting communication card | Board | Required package |
+|---|---|---|
+| U3 `<= 1.09` | `10-0431-01-01` | `150-0324-01-05` |
+| U3 `>= 2.08` | `10-0431-01-02` | `150-0317-01-07` |
+
+Never mix files between these packages. Follow the Xantrex work instructions for the exact starting U3 version and board assembly.
+
+For Freedom XC Pro 2000 part `818-2010`, Xantrex lists U1 `>= 2.96` as the prerequisite for U3 2.17 charging-control behavior. A unit at U1 2.87 / U3 1.06 follows the U3 1.0x migration package, but the U1 prerequisite must be resolved before relying on charging control.
+
+Firmware updates can reset configuration and the CAN address. Recheck model, instances, battery type, charge-current limit, and the discovered source address afterward.
+
+## Transmit controls
+
+This repository intentionally remains monitor-only. Xantrex release notes confirm that U3 2.11 improved inverter/charger on/off command handling and U3 2.17 accepts a valid CC/CV Control Current through `CHARGER_COMMAND` (`0x1FFC5`) without overwriting non-volatile MAX_CHARGE_CURRENT setting #24. That does not make arbitrary transmit payloads safe.
+
+Documented command DGNs include:
+
+- `0x1FFD3` – inverter enable, pass-through, and load-sense command
+- `0x1FFC5` – charger enable/disable/actions and CC/CV control current
+- `0x1FFC4` – charger configuration
+- `0x1FFD0` / `0x1FFCF` – inverter configuration
+
+Any future transmit implementation should be opt-in, claim a non-conflicting source address, validate target source and instance, rate-limit writes, use reserved/not-available encodings correctly, and require status/readback confirmation. Do not treat untested control fields as proven safe.
+
+## Evidence labels
+
+- **Xantrex-confirmed:** local Xantrex work instructions and release notes.
+- **RV-C-defined:** field names/encodings from the RV-C standard.
+- **Observed:** bus captures from a Freedom XC Pro 2000.
+- **Provisional:** plausible interpretations that still need controlled validation.
 
 ## License
 
-MIT — use freely, no warranty. Not affiliated with or endorsed by Xantrex / Schneider Electric.
+MIT — use freely, no warranty. Not affiliated with or endorsed by Xantrex.
